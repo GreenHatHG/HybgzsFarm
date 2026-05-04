@@ -14,11 +14,9 @@
 
   const APP_CONFIG = Object.freeze({
     apiBaseUrl: "https://cdk.hybgzs.com/api/farm",
-    userInfoUrl: "https://cdk.hybgzs.com/api/user/info",
     marketPageLimit: 20,
     recyclePageSize: 8,
     coinScale: 500_000,
-    balanceCandidateLimit: 8,
     panelId: "farm-best-crop-panel",
     styleId: "farm-best-crop-style",
     refreshButtonId: "farm-best-crop-refresh",
@@ -45,45 +43,39 @@
     noRecyclePrice: "无交易所价",
   });
 
-  const SORT_MODE = Object.freeze({
-    costPerformance: "costPerformance",
-    timePriority: "timePriority",
-    singleProfit: "singleProfit",
+  const REPLANT_KEEP_QUANTITY = 1;
+
+  const PROFIT_TAB = Object.freeze({
+    currentRound: "currentRound",
+    longTerm: "longTerm",
   });
 
-  const SORT_MODE_OPTIONS = Object.freeze(
+  const PROFIT_TAB_OPTIONS = Object.freeze(
     [
       {
-        id: SORT_MODE.costPerformance,
-        label: "性价比",
-        description: "适合钱少，想看这笔钱值不值",
-        scoreLabel: "性价比",
-      },
-      {
-        id: SORT_MODE.timePriority,
-        label: "时间优先",
-        description: "适合常回来收，想让地每小时赚更多",
-        scoreLabel: "每小时利润",
-      },
-      {
-        id: SORT_MODE.singleProfit,
-        label: "单次利润",
-        description: "适合不常看，想每次收的时候赚更多",
+        id: PROFIT_TAB.currentRound,
+        label: "当前一轮",
+        description: "按现在买 1 个再种 1 轮后的单轮利润比较。",
         scoreLabel: "单轮利润",
+        titleTip: "先看推荐，再看全表。现在按单轮利润排。",
+        tableTip: "表里有全部信息，现在按单轮利润从高到低排。",
+        footnote:
+          "单轮利润 = 单块收获总卖价 - 买1个实际总价。当前一轮会按单轮利润从高到低排序，利润相同优先买价更低的。",
+      },
+      {
+        id: PROFIT_TAB.longTerm,
+        label: "长期续种",
+        description: "假设每轮收获后留 1 个继续种，比较以后每轮还能卖出的利润。",
+        scoreLabel: "续种利润",
+        titleTip: "先看推荐，再看全表。现在按续种利润排。",
+        tableTip: "表里有全部信息，现在按续种利润从高到低排。",
+        footnote:
+          "续种利润 = 留 1 个继续种之后，这一轮剩下收成按交易所价格卖出的利润。长期续种会按续种利润从高到低排序，数值相同优先看首轮利润。",
       },
     ].map((option) => Object.freeze(option)),
   );
 
-  const DEFAULT_SORT_MODE = SORT_MODE.costPerformance;
-
-  const BALANCE_RECOMMENDATION_STATUS = Object.freeze({
-    loading: "loading",
-    ready: "ready",
-    walletUnavailable: "walletUnavailable",
-    slotsUnavailable: "slotsUnavailable",
-    noCandidates: "noCandidates",
-    noAffordable: "noAffordable",
-  });
+  const DEFAULT_PROFIT_TAB = PROFIT_TAB.currentRound;
 
   const state = {
     isLoading: false,
@@ -91,17 +83,12 @@
     rows: [],
     recommendedRow: null,
     updatedAt: "",
-    walletBalance: null,
-    maxSlots: null,
-    balanceRecommendation: null,
-    marketMap: null,
   };
 
   const uiState = loadUiState();
   const quoteCache = new Map();
   let booted = false;
   let loadToken = 0;
-  let balanceToken = 0;
   let resizeObserver = null;
   let dragState = null;
 
@@ -116,7 +103,7 @@
     window.addEventListener("pointercancel", handleWindowDragEnd);
     ensureStyle();
     render();
-    void loadData();
+    maybeLoadDataForOpenWindow();
   }
 
   if (document.readyState === "loading") {
@@ -127,7 +114,6 @@
 
   async function loadData() {
     const currentToken = ++loadToken;
-    balanceToken += 1;
     quoteCache.clear();
     state.isLoading = true;
     state.error = "";
@@ -141,10 +127,6 @@
       state.rows = snapshot.rows;
       state.recommendedRow = snapshot.recommendedRow;
       state.updatedAt = formatTime(snapshot.updatedAt);
-      state.walletBalance = snapshot.walletBalance;
-      state.maxSlots = snapshot.maxSlots;
-      state.balanceRecommendation = snapshot.balanceRecommendation;
-      state.marketMap = snapshot.marketMap;
       state.error = "";
     } catch (error) {
       if (currentToken !== loadToken) {
@@ -154,10 +136,6 @@
       state.rows = [];
       state.recommendedRow = null;
       state.updatedAt = "";
-      state.walletBalance = null;
-      state.maxSlots = null;
-      state.balanceRecommendation = null;
-      state.marketMap = null;
       state.error = toErrorMessage(error);
     } finally {
       if (currentToken !== loadToken) {
@@ -168,13 +146,15 @@
     }
   }
 
+  function maybeLoadDataForOpenWindow() {
+    if (!uiState.open || state.isLoading || state.updatedAt || state.error) {
+      return;
+    }
+    void loadData();
+  }
+
   async function collectSnapshot() {
-    const [seeds, recyclePriceMap, walletResult, slotsResult] = await Promise.all([
-      fetchSeeds(),
-      fetchRecyclePriceMap(),
-      fetchOptionalValue(fetchWalletBalance, "user-info"),
-      fetchOptionalValue(fetchFarmMaxSlots, "farm-crops"),
-    ]);
+    const [seeds, recyclePriceMap] = await Promise.all([fetchSeeds(), fetchRecyclePriceMap()]);
 
     const marketMap = await fetchMarketMap(seeds);
     const rawRows = await mapWithConcurrency(seeds, APP_CONFIG.marketFetchConcurrency, async (seed) =>
@@ -185,25 +165,12 @@
       ...row,
       expectedHarvestAt: buildExpectedHarvestAt(updatedAt, row.growthSeconds),
     }));
-    const sortedRows = sortRows(rows, uiState.sortMode);
-    const recommendedRow = getRecommendedRow(sortedRows, uiState.sortMode);
-    const balanceRecommendation = await buildBalanceRecommendation({
-      rows: sortedRows,
-      marketMap,
-      walletBalance: walletResult.value,
-      maxSlots: slotsResult.value,
-      sortMode: uiState.sortMode,
-      walletError: walletResult.error,
-      slotsError: slotsResult.error,
-    });
+    const sortedRows = sortRows(rows, uiState.profitTab);
+    const recommendedRow = getRecommendedRow(sortedRows, uiState.profitTab);
 
     return {
       rows: sortedRows,
       recommendedRow,
-      walletBalance: walletResult.value,
-      maxSlots: slotsResult.value,
-      balanceRecommendation,
-      marketMap,
       updatedAt: new Date(updatedAt),
     };
   }
@@ -239,39 +206,6 @@
     }
 
     return priceMap;
-  }
-
-  async function fetchWalletBalance() {
-    const response = await requestJson(APP_CONFIG.userInfoUrl);
-    const walletBalance = toNullableNumber(response.data?.walletBalance);
-    if (!Number.isFinite(walletBalance)) {
-      throw new Error("余额字段缺失");
-    }
-    return walletBalance;
-  }
-
-  async function fetchFarmMaxSlots() {
-    const response = await requestJson("/crops");
-    const maxSlots = toNullableNumber(response.maxSlots);
-    if (!Number.isFinite(maxSlots)) {
-      throw new Error("地块数字段缺失");
-    }
-    return Math.max(0, Math.floor(maxSlots));
-  }
-
-  async function fetchOptionalValue(loader, label) {
-    try {
-      return {
-        value: await loader(),
-        error: "",
-      };
-    } catch (error) {
-      console.warn(`[farm-best-crop] ${label}`, error);
-      return {
-        value: null,
-        error: toErrorMessage(error),
-      };
-    }
   }
 
   async function fetchMarketMap(seeds) {
@@ -346,6 +280,8 @@
       Number.isFinite(roundSaleAmount) && Number.isFinite(buyOneTotal)
         ? roundSaleAmount - buyOneTotal
         : null;
+    const replantSaleQuantity = recyclePrice !== null ? Math.max(seed.harvestQuantity - REPLANT_KEEP_QUANTITY, 0) : null;
+    const replantProfit = Number.isFinite(replantSaleQuantity) && recyclePrice !== null ? replantSaleQuantity * recyclePrice : null;
     const hourlyProfit =
       roundProfit !== null && seed.growthSeconds > 0
         ? roundProfit / (seed.growthSeconds / 3600)
@@ -378,6 +314,8 @@
       buyOneTotal,
       roundSaleAmount,
       roundProfit,
+      replantSaleQuantity,
+      replantProfit,
       hourlyProfit,
       costPerformance,
       officialDiff,
@@ -517,98 +455,80 @@
     return payload;
   }
 
-  function sortRows(rows, sortMode = uiState.sortMode) {
-    return sortRowsByMode(rows, sortMode);
+  function sortRows(rows, profitTab = uiState.profitTab) {
+    return sortRowsByProfitTab(rows, profitTab);
   }
 
-  function sortRowsByMode(rows, sortMode) {
-    const normalizedSortMode = normalizeSortMode(sortMode);
-    return [...rows].sort((left, right) => {
-      const sortDiff = compareRowsBySortMode(left, right, normalizedSortMode);
-      if (sortDiff !== 0) {
-        return sortDiff;
-      }
-      return left.name.localeCompare(right.name, "zh-CN");
-    });
+  function sortRowsByProfitTab(rows, profitTab = uiState.profitTab) {
+    const normalizedProfitTab = normalizeProfitTab(profitTab);
+    return [...rows].sort((left, right) => compareRowsByProfitTab(left, right, normalizedProfitTab));
   }
 
-  function compareRowsBySortMode(left, right, sortMode) {
-    if (sortMode === SORT_MODE.timePriority) {
-      const hourlyDiff = compareFiniteDesc(left.hourlyProfit, right.hourlyProfit);
-      if (hourlyDiff !== 0) {
-        return hourlyDiff;
+  function compareRowsByProfitTab(left, right, profitTab) {
+    if (profitTab === PROFIT_TAB.longTerm) {
+      const replantProfitDiff = compareFiniteDesc(left.replantProfit, right.replantProfit);
+      if (replantProfitDiff !== 0) {
+        return replantProfitDiff;
       }
 
-      const harvestDiff = compareFiniteAsc(left.expectedHarvestAt, right.expectedHarvestAt);
-      if (harvestDiff !== 0) {
-        return harvestDiff;
-      }
-
-      return compareFiniteAsc(left.buyOneTotal, right.buyOneTotal);
-    }
-
-    if (sortMode === SORT_MODE.singleProfit) {
       const roundProfitDiff = compareFiniteDesc(left.roundProfit, right.roundProfit);
       if (roundProfitDiff !== 0) {
         return roundProfitDiff;
       }
 
-      const hourlyDiff = compareFiniteDesc(left.hourlyProfit, right.hourlyProfit);
-      if (hourlyDiff !== 0) {
-        return hourlyDiff;
+      const costDiff = compareFiniteAsc(left.buyOneTotal, right.buyOneTotal);
+      if (costDiff !== 0) {
+        return costDiff;
       }
 
-      return compareFiniteAsc(left.buyOneTotal, right.buyOneTotal);
+      return left.name.localeCompare(right.name, "zh-CN");
     }
 
-    const costDiff = compareFiniteDesc(left.costPerformance, right.costPerformance);
+    const roundProfitDiff = compareFiniteDesc(left.roundProfit, right.roundProfit);
+    if (roundProfitDiff !== 0) {
+      return roundProfitDiff;
+    }
+
+    const costDiff = compareFiniteAsc(left.buyOneTotal, right.buyOneTotal);
     if (costDiff !== 0) {
       return costDiff;
     }
 
-    const hourlyDiff = compareFiniteDesc(left.hourlyProfit, right.hourlyProfit);
-    if (hourlyDiff !== 0) {
-      return hourlyDiff;
-    }
-
-    return compareFiniteAsc(left.buyOneTotal, right.buyOneTotal);
+    return left.name.localeCompare(right.name, "zh-CN");
   }
 
-  function getRecommendedRow(rows, sortMode) {
-    return rows.find((row) => isRecommendedCandidate(row, sortMode)) ?? null;
+  function getRecommendedRow(rows, profitTab = uiState.profitTab) {
+    return rows.find((row) => isRecommendedCandidate(row, profitTab)) ?? null;
   }
 
-  function isRecommendedCandidate(row, sortMode = uiState.sortMode) {
+  function isRecommendedCandidate(row, profitTab = uiState.profitTab) {
     const isAvailable = row.statusKey === "ok" || row.statusKey === "marketEmptyOfficial";
-    return isAvailable && Number.isFinite(getSortMetricValue(row, sortMode));
+    return isAvailable && Number.isFinite(getProfitMetricValue(row, profitTab));
   }
 
-  function getSortMetricValue(row, sortMode = uiState.sortMode) {
-    const normalizedSortMode = normalizeSortMode(sortMode);
-    if (normalizedSortMode === SORT_MODE.timePriority) {
-      return row.hourlyProfit;
+  function getProfitMetricValue(row, profitTab = uiState.profitTab) {
+    if (normalizeProfitTab(profitTab) === PROFIT_TAB.longTerm) {
+      return row.replantProfit;
     }
-    if (normalizedSortMode === SORT_MODE.singleProfit) {
-      return row.roundProfit;
-    }
-    return row.costPerformance;
+    return row.roundProfit;
   }
 
-  function getSortMetricText(row, sortMode = uiState.sortMode) {
-    const value = getSortMetricValue(row, sortMode);
-    if (normalizeSortMode(sortMode) === SORT_MODE.costPerformance) {
-      return formatRatio(value);
-    }
-    return formatCoin(value);
+  function getRecommendationMetricText(row, profitTab = uiState.profitTab) {
+    return formatCoin(getProfitMetricValue(row, profitTab));
   }
 
-  function getSortModeConfig(sortMode = uiState.sortMode) {
-    const normalizedSortMode = normalizeSortMode(sortMode);
-    return SORT_MODE_OPTIONS.find((option) => option.id === normalizedSortMode) ?? SORT_MODE_OPTIONS[0];
+  function getProfitTabConfig(profitTab = uiState.profitTab) {
+    const normalizedProfitTab = normalizeProfitTab(profitTab);
+    return PROFIT_TAB_OPTIONS.find((option) => option.id === normalizedProfitTab) ?? PROFIT_TAB_OPTIONS[0];
   }
 
-  function normalizeSortMode(sortMode) {
-    return SORT_MODE_OPTIONS.some((option) => option.id === sortMode) ? sortMode : DEFAULT_SORT_MODE;
+  function normalizeProfitTab(profitTab) {
+    return PROFIT_TAB_OPTIONS.some((option) => option.id === profitTab) ? profitTab : DEFAULT_PROFIT_TAB;
+  }
+
+  function applyCurrentProfitTab() {
+    state.rows = sortRowsByProfitTab(state.rows, uiState.profitTab);
+    state.recommendedRow = getRecommendedRow(state.rows, uiState.profitTab);
   }
 
   function buildExpectedHarvestAt(updatedAt, growthSeconds) {
@@ -616,327 +536,6 @@
       return null;
     }
     return updatedAt + growthSeconds * 1000;
-  }
-
-  function applyCurrentSortMode() {
-    state.rows = sortRowsByMode(state.rows, uiState.sortMode);
-    state.recommendedRow = getRecommendedRow(state.rows, uiState.sortMode);
-  }
-
-  async function refreshBalanceRecommendation() {
-    const currentToken = ++balanceToken;
-    state.balanceRecommendation = createBalanceRecommendationMessage(
-      BALANCE_RECOMMENDATION_STATUS.loading,
-      "正在按余额算怎么买更合适。",
-      {
-        walletBalance: state.walletBalance,
-        maxSlots: state.maxSlots,
-      },
-    );
-    render();
-
-    const balanceRecommendation = await buildBalanceRecommendation({
-      rows: state.rows,
-      marketMap: state.marketMap,
-      walletBalance: state.walletBalance,
-      maxSlots: state.maxSlots,
-      sortMode: uiState.sortMode,
-    });
-
-    if (currentToken !== balanceToken) {
-      return;
-    }
-
-    state.balanceRecommendation = balanceRecommendation;
-    render();
-  }
-
-  async function buildBalanceRecommendation(context) {
-    if (!Number.isFinite(context.walletBalance)) {
-      return createBalanceRecommendationMessage(
-        BALANCE_RECOMMENDATION_STATUS.walletUnavailable,
-        context.walletError || "余额拿不到",
-        {
-          maxSlots: context.maxSlots,
-        },
-      );
-    }
-
-    if (!Number.isFinite(context.maxSlots)) {
-      return createBalanceRecommendationMessage(
-        BALANCE_RECOMMENDATION_STATUS.slotsUnavailable,
-        context.slotsError || "地块数拿不到",
-        {
-          walletBalance: context.walletBalance,
-        },
-      );
-    }
-
-    const maxSlots = Math.max(0, Math.floor(context.maxSlots));
-    const candidateRows = context.rows
-      .filter((row) => isRecommendedCandidate(row, context.sortMode))
-      .slice(0, APP_CONFIG.balanceCandidateLimit);
-
-    if (candidateRows.length === 0) {
-      return createBalanceRecommendationMessage(
-        BALANCE_RECOMMENDATION_STATUS.noCandidates,
-        "现在没有可参与余额推荐的作物。",
-        {
-          walletBalance: context.walletBalance,
-          maxSlots,
-        },
-      );
-    }
-
-    const candidateOptions = await mapWithConcurrency(
-      candidateRows,
-      APP_CONFIG.marketFetchConcurrency,
-      async (row) => buildBalanceCandidate(row, context.marketMap?.get(row.seedId), maxSlots),
-    );
-    const bestCombination = findBestBalanceCombination(
-      candidateOptions.filter((candidate) => candidate.options.length > 0),
-      context.walletBalance,
-      maxSlots,
-      context.sortMode,
-    );
-
-    if (!bestCombination) {
-      return createBalanceRecommendationMessage(
-        BALANCE_RECOMMENDATION_STATUS.noAffordable,
-        "当前余额买不起任何1块。",
-        {
-          walletBalance: context.walletBalance,
-          maxSlots,
-        },
-      );
-    }
-
-    return {
-      status: BALANCE_RECOMMENDATION_STATUS.ready,
-      message: "",
-      walletBalance: context.walletBalance,
-      maxSlots,
-      sortMode: normalizeSortMode(context.sortMode),
-      ...bestCombination,
-    };
-  }
-
-  async function buildBalanceCandidate(row, marketSnapshot, maxSlots) {
-    const options = [];
-    const maxQuantity =
-      row.statusKey === "marketEmptyOfficial"
-        ? maxSlots
-        : Math.min(maxSlots, Math.max(0, Math.floor(row.marketTotalQuantity)));
-
-    for (let quantity = 1; quantity <= maxQuantity; quantity += 1) {
-      let option = null;
-      if (row.statusKey === "marketEmptyOfficial") {
-        option = buildBalanceOption(row, quantity, row.officialSeedPrice * quantity);
-      } else if (row.statusKey === "ok") {
-        option = await buildQuotedBalanceOption(row, marketSnapshot?.listings ?? [], quantity);
-      }
-
-      if (option) {
-        options.push(option);
-      }
-    }
-
-    return {
-      row,
-      options,
-    };
-  }
-
-  async function buildQuotedBalanceOption(row, listings, quantity) {
-    if (listings.length === 0) {
-      return null;
-    }
-
-    const quoteResult = await quotePurchase(listings, quantity);
-    if (quoteResult.status !== "ok") {
-      return null;
-    }
-
-    return buildBalanceOption(row, quantity, quoteResult.buyerPaysTotal);
-  }
-
-  function buildBalanceOption(row, quantity, totalCost) {
-    if (!Number.isFinite(totalCost) || !Number.isFinite(row.roundSaleAmount) || row.growthSeconds <= 0) {
-      return null;
-    }
-
-    const totalSaleAmount = row.roundSaleAmount * quantity;
-    const totalRoundProfit = totalSaleAmount - totalCost;
-    const totalHourlyProfit = totalRoundProfit / (row.growthSeconds / 3600);
-
-    return {
-      quantity,
-      totalCost,
-      totalRoundProfit,
-      totalHourlyProfit,
-      costPerformance: totalCost > 0 ? totalHourlyProfit / totalCost : null,
-      expectedHarvestAt: row.expectedHarvestAt,
-    };
-  }
-
-  function findBestBalanceCombination(candidates, walletBalance, maxSlots, sortMode) {
-    let bestCombination = null;
-    const selectedOptions = [];
-
-    function visit(index, totalQuantity, totalCost, totalRoundProfit, totalHourlyProfit) {
-      if (totalCost > walletBalance || totalQuantity > maxSlots) {
-        return;
-      }
-
-      if (index >= candidates.length) {
-        if (selectedOptions.length === 0) {
-          return;
-        }
-
-        const combination = buildBalanceCombination(
-          selectedOptions,
-          walletBalance,
-          maxSlots,
-          totalQuantity,
-          totalCost,
-          totalRoundProfit,
-          totalHourlyProfit,
-        );
-
-        if (compareBalanceCombination(combination, bestCombination, sortMode) < 0) {
-          bestCombination = combination;
-        }
-        return;
-      }
-
-      visit(index + 1, totalQuantity, totalCost, totalRoundProfit, totalHourlyProfit);
-
-      const candidate = candidates[index];
-      for (const option of candidate.options) {
-        if (totalQuantity + option.quantity > maxSlots || totalCost + option.totalCost > walletBalance) {
-          continue;
-        }
-
-        selectedOptions.push({
-          row: candidate.row,
-          ...option,
-        });
-        visit(
-          index + 1,
-          totalQuantity + option.quantity,
-          totalCost + option.totalCost,
-          totalRoundProfit + option.totalRoundProfit,
-          totalHourlyProfit + option.totalHourlyProfit,
-        );
-        selectedOptions.pop();
-      }
-    }
-
-    visit(0, 0, 0, 0, 0);
-    return bestCombination;
-  }
-
-  function buildBalanceCombination(items, walletBalance, maxSlots, totalQuantity, totalCost, totalRoundProfit, totalHourlyProfit) {
-    const normalizedItems = [...items].sort((left, right) => {
-      if (left.quantity !== right.quantity) {
-        return right.quantity - left.quantity;
-      }
-      return left.row.name.localeCompare(right.row.name, "zh-CN");
-    });
-
-    return {
-      items: normalizedItems,
-      totalQuantity,
-      totalCost,
-      totalRoundProfit,
-      totalHourlyProfit,
-      costPerformance: totalCost > 0 ? totalHourlyProfit / totalCost : null,
-      remainingBalance: walletBalance - totalCost,
-      unusedSlots: maxSlots - totalQuantity,
-    };
-  }
-
-  function compareBalanceCombination(left, right, sortMode) {
-    if (!left && !right) {
-      return 0;
-    }
-    if (!left) {
-      return 1;
-    }
-    if (!right) {
-      return -1;
-    }
-
-    const normalizedSortMode = normalizeSortMode(sortMode);
-    if (normalizedSortMode === SORT_MODE.timePriority) {
-      const hourlyDiff = compareFiniteDesc(left.totalHourlyProfit, right.totalHourlyProfit);
-      if (hourlyDiff !== 0) {
-        return hourlyDiff;
-      }
-
-      const roundProfitDiff = compareFiniteDesc(left.totalRoundProfit, right.totalRoundProfit);
-      if (roundProfitDiff !== 0) {
-        return roundProfitDiff;
-      }
-
-      const costDiff = compareFiniteAsc(left.totalCost, right.totalCost);
-      if (costDiff !== 0) {
-        return costDiff;
-      }
-    } else if (normalizedSortMode === SORT_MODE.singleProfit) {
-      const roundProfitDiff = compareFiniteDesc(left.totalRoundProfit, right.totalRoundProfit);
-      if (roundProfitDiff !== 0) {
-        return roundProfitDiff;
-      }
-
-      const hourlyDiff = compareFiniteDesc(left.totalHourlyProfit, right.totalHourlyProfit);
-      if (hourlyDiff !== 0) {
-        return hourlyDiff;
-      }
-
-      const costDiff = compareFiniteAsc(left.totalCost, right.totalCost);
-      if (costDiff !== 0) {
-        return costDiff;
-      }
-    } else {
-      const ratioDiff = compareFiniteDesc(left.costPerformance, right.costPerformance);
-      if (ratioDiff !== 0) {
-        return ratioDiff;
-      }
-
-      const hourlyDiff = compareFiniteDesc(left.totalHourlyProfit, right.totalHourlyProfit);
-      if (hourlyDiff !== 0) {
-        return hourlyDiff;
-      }
-
-      const costDiff = compareFiniteAsc(left.totalCost, right.totalCost);
-      if (costDiff !== 0) {
-        return costDiff;
-      }
-    }
-
-    return buildBalanceSignature(left).localeCompare(buildBalanceSignature(right), "zh-CN");
-  }
-
-  function buildBalanceSignature(combination) {
-    return combination.items.map((item) => `${item.row.name}:${item.quantity}`).join("|");
-  }
-
-  function createBalanceRecommendationMessage(status, message, extra = {}) {
-    return {
-      status,
-      message,
-      walletBalance: extra.walletBalance ?? null,
-      maxSlots: extra.maxSlots ?? null,
-      items: [],
-      totalQuantity: 0,
-      totalCost: null,
-      totalRoundProfit: null,
-      totalHourlyProfit: null,
-      costPerformance: null,
-      remainingBalance: null,
-      unusedSlots: null,
-    };
   }
 
   function compareFiniteDesc(left, right) {
@@ -1001,7 +600,7 @@
 
     return {
       open: false,
-      sortMode: DEFAULT_SORT_MODE,
+      profitTab: DEFAULT_PROFIT_TAB,
       left,
       top,
       width,
@@ -1026,7 +625,7 @@
 
     return {
       open: Boolean(nextState.open),
-      sortMode: normalizeSortMode(nextState.sortMode),
+      profitTab: normalizeProfitTab(nextState.profitTab),
       left: clamp(toFiniteNumber(nextState.left, defaultState.left), APP_CONFIG.windowMargin, maxLeft),
       top: clamp(toFiniteNumber(nextState.top, defaultState.top), APP_CONFIG.windowMargin, maxTop),
       width,
@@ -1183,7 +782,11 @@
     const toggleButton = panel.querySelector(`#${APP_CONFIG.toggleButtonId}`);
     if (toggleButton) {
       toggleButton.addEventListener("click", () => {
-        setUiState({ open: !uiState.open }, true);
+        const nextOpen = !uiState.open;
+        setUiState({ open: nextOpen }, true);
+        if (nextOpen) {
+          maybeLoadDataForOpenWindow();
+        }
         render();
       });
     }
@@ -1205,15 +808,16 @@
       });
     }
 
-    panel.querySelectorAll("[data-sort-mode]").forEach((button) => {
+    panel.querySelectorAll("[data-profit-tab]").forEach((button) => {
       button.addEventListener("click", () => {
-        const nextSortMode = normalizeSortMode(button.getAttribute("data-sort-mode"));
-        if (nextSortMode === uiState.sortMode) {
+        const nextProfitTab = normalizeProfitTab(button.getAttribute("data-profit-tab"));
+        if (nextProfitTab === uiState.profitTab) {
           return;
         }
-        setUiState({ sortMode: nextSortMode }, true);
-        applyCurrentSortMode();
-        void refreshBalanceRecommendation();
+        setUiState({ profitTab: nextProfitTab }, true);
+        applyCurrentProfitTab();
+        maybeLoadDataForOpenWindow();
+        render();
       });
     });
 
@@ -1414,7 +1018,7 @@
         min-height: 0;
       }
 
-      .farm-helper-mode-panel {
+      .farm-helper-tab-panel {
         display: flex;
         flex-direction: column;
         gap: 10px;
@@ -1424,13 +1028,13 @@
         border: 1px solid rgba(104, 137, 91, 0.12);
       }
 
-      .farm-helper-mode-buttons {
+      .farm-helper-tab-buttons {
         display: flex;
         flex-wrap: wrap;
         gap: 10px;
       }
 
-      .farm-helper-mode-button {
+      .farm-helper-tab-button {
         border: 1px solid rgba(91, 139, 69, 0.2);
         border-radius: 999px;
         padding: 9px 14px;
@@ -1441,14 +1045,14 @@
         cursor: pointer;
       }
 
-      .farm-helper-mode-button.is-active {
+      .farm-helper-tab-button.is-active {
         border-color: transparent;
         background: linear-gradient(135deg, #5b8b45, #88b36d);
         color: #fff;
         box-shadow: 0 10px 22px rgba(55, 87, 41, 0.18);
       }
 
-      .farm-helper-mode-desc {
+      .farm-helper-tab-desc {
         color: #4f6b47;
         font-size: 13px;
       }
@@ -1595,12 +1199,8 @@
       .farm-helper-table {
         width: 100%;
         border-collapse: collapse;
-        min-width: 1240px;
+        min-width: 1320px;
         font-size: 12px;
-      }
-
-      .farm-helper-table.farm-helper-table-compact {
-        min-width: 760px;
       }
 
       .farm-helper-table thead th {
@@ -1697,13 +1297,13 @@
   }
 
   function buildPanelHtml() {
-    const sortMode = getSortModeConfig();
+    const profitTabConfig = getProfitTabConfig();
     const mainBlock = [
+      buildProfitTabHtml(profitTabConfig),
       state.isLoading ? `<div class="farm-helper-state">正在抓接口并计算，请等一下。</div>` : "",
-      buildSortModeHtml(sortMode),
       state.error
         ? `<div class="farm-helper-error">数据加载失败：${escapeHtml(state.error)}</div>`
-        : [buildRecommendHtml(sortMode), buildBalanceRecommendHtml(sortMode), buildTableHtml(sortMode)].join(""),
+        : [buildRecommendHtml(profitTabConfig), buildTableHtml(profitTabConfig)].join(""),
     ].join("");
 
     return `
@@ -1723,7 +1323,7 @@
         <div id="${APP_CONFIG.dragHandleId}" class="farm-helper-window-bar">
           <div class="farm-helper-window-title">
             <strong>种植助手</strong>
-            <span>先看推荐，再看全表。现在按${escapeHtml(sortMode.label)}排。</span>
+            <span>${escapeHtml(profitTabConfig.titleTip)}</span>
           </div>
           <div class="farm-helper-window-actions">
             <span class="farm-helper-time">${state.updatedAt ? `更新 ${escapeHtml(state.updatedAt)}` : "还没拿到数据"}</span>
@@ -1739,7 +1339,7 @@
           <div class="farm-helper-card">
             ${mainBlock}
             <div class="farm-helper-footnote">
-              性价比 = 每小时利润 / 买1个实际总价。时间优先看每小时利润，单次利润看单轮利润。预计收菜时间 = 本次刷新时间 + 生长时间。按余额推荐会用当前余额和地块数来算组合。菜场没货时按官方价算，菜场顺序不可信，脚本会自己排最低价。
+              ${escapeHtml(profitTabConfig.footnote)} 预计收菜时间 = 本次刷新时间 + 生长时间。菜场没货时按官方价算，菜场顺序不可信，脚本会自己排最低价。
             </div>
           </div>
         </div>
@@ -1747,14 +1347,14 @@
     `;
   }
 
-  function buildSortModeHtml(currentSortMode) {
-    const buttonsHtml = SORT_MODE_OPTIONS.map((option) => {
-      const isActive = option.id === currentSortMode.id;
+  function buildProfitTabHtml(currentTabConfig = getProfitTabConfig()) {
+    const buttonsHtml = PROFIT_TAB_OPTIONS.map((option) => {
+      const isActive = option.id === currentTabConfig.id;
       return `
         <button
-          class="farm-helper-mode-button ${isActive ? "is-active" : ""}"
+          class="farm-helper-tab-button ${isActive ? "is-active" : ""}"
           type="button"
-          data-sort-mode="${escapeHtml(option.id)}"
+          data-profit-tab="${escapeHtml(option.id)}"
           aria-pressed="${isActive ? "true" : "false"}"
         >
           ${escapeHtml(option.label)}
@@ -1764,27 +1364,27 @@
 
     return `
       <div class="farm-helper-section">
-        <div class="farm-helper-mode-panel">
+        <div class="farm-helper-tab-panel">
           <div class="farm-helper-section-head">
-            <h3>怎么算</h3>
-            <span class="farm-helper-tip">刷新后会记住你上次选的算法</span>
+            <h3>看哪种利润</h3>
+            <span class="farm-helper-tip">会记住你上次看的页签</span>
           </div>
-          <div class="farm-helper-mode-buttons">${buttonsHtml}</div>
-          <div class="farm-helper-mode-desc">
-            现在用 <strong>${escapeHtml(currentSortMode.label)}</strong>：${escapeHtml(currentSortMode.description)}
+          <div class="farm-helper-tab-buttons">${buttonsHtml}</div>
+          <div class="farm-helper-tab-desc">
+            当前看 <strong>${escapeHtml(currentTabConfig.label)}</strong>：${escapeHtml(currentTabConfig.description)}
           </div>
         </div>
       </div>
     `;
   }
 
-  function buildRecommendHtml(currentSortMode = getSortModeConfig()) {
+  function buildRecommendHtml(currentRule = getProfitTabConfig()) {
     if (!state.recommendedRow) {
       return `
         <div class="farm-helper-section">
           <div class="farm-helper-section-head">
             <h3>当前推荐</h3>
-            <span class="farm-helper-tip">当前算法：${escapeHtml(currentSortMode.label)}</span>
+            <span class="farm-helper-tip">当前规则：${escapeHtml(currentRule.label)}</span>
           </div>
           <div class="farm-helper-empty">现在没有能直接推荐的作物。你可以先看下面全表。</div>
         </div>
@@ -1797,7 +1397,7 @@
       <div class="farm-helper-section">
         <div class="farm-helper-section-head">
           <h3>当前推荐</h3>
-          <span class="farm-helper-tip">当前算法：${escapeHtml(currentSortMode.label)}</span>
+          <span class="farm-helper-tip">当前规则：${escapeHtml(currentRule.label)}</span>
         </div>
         <div class="farm-helper-recommend">
           <div class="farm-helper-hero">
@@ -1809,14 +1409,14 @@
                 </span>
                 <span class="farm-helper-status ${statusTone}">${escapeHtml(row.statusText)}</span>
               </div>
-              <div class="farm-helper-tip">现在用 ${escapeHtml(currentSortMode.label)}：${escapeHtml(currentSortMode.description)}</div>
+              <div class="farm-helper-tip">当前规则：${escapeHtml(currentRule.description)}</div>
               <div class="farm-helper-tip">
                 生长 ${escapeHtml(formatDuration(row.growthSeconds))}，单块收 ${escapeHtml(String(row.harvestQuantity))} 个，预计 ${escapeHtml(formatDateTime(row.expectedHarvestAt))} 收。
               </div>
             </div>
             <div class="farm-helper-score">
-              <span>${escapeHtml(currentSortMode.scoreLabel)}</span>
-              <strong>${escapeHtml(getSortMetricText(row, currentSortMode.id))}</strong>
+              <span>${escapeHtml(currentRule.scoreLabel)}</span>
+              <strong>${escapeHtml(getRecommendationMetricText(row, currentRule.id))}</strong>
             </div>
           </div>
           <div class="farm-helper-metrics">
@@ -1824,74 +1424,12 @@
             ${buildMetricHtml("每小时利润", formatCoin(row.hourlyProfit))}
             ${buildMetricHtml("买1个实际总价", formatPurchase(row.buyOneResult))}
             ${buildMetricHtml("单轮利润", formatCoin(row.roundProfit))}
+            ${buildMetricHtml("续种利润", formatCoin(row.replantProfit))}
             ${buildMetricHtml("预计收菜时间", formatDateTime(row.expectedHarvestAt))}
             ${buildMetricHtml("交易所单价", formatCoin(row.recyclePrice))}
             ${buildMetricHtml("菜场最低单价", formatCoin(row.marketMinUnitPrice))}
             ${buildMetricHtml("官方种子单价", formatCoin(row.officialSeedPrice))}
           </div>
-        </div>
-      </div>
-    `;
-  }
-
-  function buildBalanceRecommendHtml(currentSortMode = getSortModeConfig()) {
-    const recommendation = state.balanceRecommendation;
-    const sectionHead = `
-      <div class="farm-helper-section-head">
-        <h3>按余额推荐</h3>
-        <span class="farm-helper-tip">按${escapeHtml(currentSortMode.label)}算整套买法</span>
-      </div>
-    `;
-
-    if (!recommendation || recommendation.status === BALANCE_RECOMMENDATION_STATUS.loading) {
-      return `
-        <div class="farm-helper-section">
-          ${sectionHead}
-          <div class="farm-helper-state">正在按余额算怎么买更合适。</div>
-        </div>
-      `;
-    }
-
-    if (recommendation.status !== BALANCE_RECOMMENDATION_STATUS.ready) {
-      return `
-        <div class="farm-helper-section">
-          ${sectionHead}
-          <div class="farm-helper-empty">${escapeHtml(recommendation.message || "现在还算不出余额推荐。")}</div>
-        </div>
-      `;
-    }
-
-    return `
-      <div class="farm-helper-section">
-        ${sectionHead}
-        <div class="farm-helper-recommend">
-          <div class="farm-helper-hero">
-            <div>
-              <div class="farm-helper-name">
-                <strong>${escapeHtml(formatBalanceSummary(recommendation))}</strong>
-              </div>
-              <div class="farm-helper-tip">现在用 ${escapeHtml(currentSortMode.label)}：${escapeHtml(currentSortMode.description)}</div>
-              <div class="farm-helper-tip">
-                一共买 ${escapeHtml(String(recommendation.totalQuantity))} 块，还空 ${escapeHtml(String(recommendation.unusedSlots))} 块，余额还剩 ${escapeHtml(formatCoin(recommendation.remainingBalance))}。
-              </div>
-            </div>
-            <div class="farm-helper-score">
-              <span>${escapeHtml(currentSortMode.scoreLabel)}</span>
-              <strong>${escapeHtml(getBalanceSortMetricText(recommendation, currentSortMode.id))}</strong>
-            </div>
-          </div>
-          <div class="farm-helper-metrics">
-            ${buildMetricHtml("当前余额", formatCoin(recommendation.walletBalance))}
-            ${buildMetricHtml("可种地块数", formatCount(recommendation.maxSlots, "块"))}
-            ${buildMetricHtml("组合总购买数", formatCount(recommendation.totalQuantity, "块"))}
-            ${buildMetricHtml("实际总花费", formatCoin(recommendation.totalCost))}
-            ${buildMetricHtml("剩余余额", formatCoin(recommendation.remainingBalance))}
-            ${buildMetricHtml("组合总单轮利润", formatCoin(recommendation.totalRoundProfit))}
-            ${buildMetricHtml("组合总每小时利润", formatCoin(recommendation.totalHourlyProfit))}
-            ${buildMetricHtml("组合性价比", formatRatio(recommendation.costPerformance))}
-            ${buildMetricHtml("未使用地块", formatCount(recommendation.unusedSlots, "块"))}
-          </div>
-          ${buildBalanceDetailTableHtml(recommendation)}
         </div>
       </div>
     `;
@@ -1906,42 +1444,7 @@
     `;
   }
 
-  function buildBalanceDetailTableHtml(recommendation) {
-    const rowsHtml = recommendation.items
-      .map(
-        (item) => `
-          <tr>
-            <td>${escapeHtml(item.row.name)}</td>
-            <td>${escapeHtml(formatCount(item.quantity, "个"))}</td>
-            <td>${escapeHtml(formatCoin(item.totalCost))}</td>
-            <td>${escapeHtml(formatCoin(item.totalRoundProfit))}</td>
-            <td>${escapeHtml(formatCoin(item.totalHourlyProfit))}</td>
-            <td>${escapeHtml(formatDateTime(item.expectedHarvestAt))}</td>
-          </tr>
-        `,
-      )
-      .join("");
-
-    return `
-      <div class="farm-helper-table-wrap">
-        <table class="farm-helper-table farm-helper-table-compact">
-          <thead>
-            <tr>
-              <th>作物</th>
-              <th>买几个</th>
-              <th>这几个的实际总价</th>
-              <th>这几个的单轮利润</th>
-              <th>这几个的每小时利润</th>
-              <th>预计收菜时间</th>
-            </tr>
-          </thead>
-          <tbody>${rowsHtml}</tbody>
-        </table>
-      </div>
-    `;
-  }
-
-  function buildTableHtml(currentSortMode = getSortModeConfig()) {
+  function buildTableHtml(currentRule = getProfitTabConfig()) {
     if (state.rows.length === 0) {
       return `
         <div class="farm-helper-section">
@@ -1975,6 +1478,7 @@
             <td>${escapeHtml(formatCoin(row.marketMinUnitPrice))}</td>
             <td>${buildTableValue(formatPurchase(row.buyOneResult), buyOneTone)}</td>
             <td>${escapeHtml(formatCoin(row.roundProfit))}</td>
+            <td>${escapeHtml(formatCoin(row.replantProfit))}</td>
             <td>${escapeHtml(formatCoin(row.hourlyProfit))}</td>
             <td>${escapeHtml(formatDateTime(row.expectedHarvestAt))}</td>
             <td>${escapeHtml(formatRatio(row.costPerformance))}</td>
@@ -1990,7 +1494,7 @@
       <div class="farm-helper-section">
         <div class="farm-helper-section-head">
           <h3>全部作物</h3>
-          <span class="farm-helper-tip">表里有全部信息，现在按${escapeHtml(currentSortMode.label)}排。</span>
+          <span class="farm-helper-tip">${escapeHtml(currentRule.tableTip)}</span>
         </div>
         <div class="farm-helper-table-wrap">
           <table class="farm-helper-table">
@@ -2004,6 +1508,7 @@
                 <th>菜场最低单价</th>
                 <th>买1个实际总价</th>
                 <th>单轮利润</th>
+                <th>续种利润</th>
                 <th>每小时利润</th>
                 <th>预计收菜时间</th>
                 <th>性价比</th>
@@ -2108,26 +1613,6 @@
     return "--";
   }
 
-  function getBalanceSortMetricText(recommendation, sortMode = uiState.sortMode) {
-    const normalizedSortMode = normalizeSortMode(sortMode);
-    if (normalizedSortMode === SORT_MODE.timePriority) {
-      return formatCoin(recommendation.totalHourlyProfit);
-    }
-    if (normalizedSortMode === SORT_MODE.singleProfit) {
-      return formatCoin(recommendation.totalRoundProfit);
-    }
-    return formatRatio(recommendation.costPerformance);
-  }
-
-  function formatBalanceSummary(recommendation) {
-    if (recommendation.items.length <= 1) {
-      const item = recommendation.items[0];
-      return `${item.row.name} x ${formatCount(item.quantity, "个")}`;
-    }
-
-    return `${recommendation.items.length}种搭配，买${formatCount(recommendation.totalQuantity, "块")}`;
-  }
-
   function formatCoin(value) {
     if (!Number.isFinite(value)) {
       return "--";
@@ -2193,13 +1678,6 @@
     return `${padNumber(date.getMonth() + 1)}-${padNumber(date.getDate())} ${padNumber(date.getHours())}:${padNumber(date.getMinutes())}`;
   }
 
-  function formatCount(value, unit) {
-    if (!Number.isFinite(value)) {
-      return "--";
-    }
-    return `${value.toLocaleString("zh-CN")}${unit}`;
-  }
-
   function formatTime(date) {
     return new Intl.DateTimeFormat("zh-CN", {
       hour: "2-digit",
@@ -2224,11 +1702,6 @@
   function toNumber(value) {
     const numberValue = Number(value);
     return Number.isFinite(numberValue) ? numberValue : 0;
-  }
-
-  function toNullableNumber(value) {
-    const numberValue = Number(value);
-    return Number.isFinite(numberValue) ? numberValue : null;
   }
 
   function toFiniteNumber(value, fallbackValue) {
