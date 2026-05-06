@@ -397,7 +397,7 @@
   }
 
   function buildGroupKey(seedId, maturesAtMs) {
-    return `${seedId}|${Math.floor(maturesAtMs / 1000)}`;
+    return `${seedId}|${Math.floor(maturesAtMs / 60000)}`;
   }
 
   function buildAnonymousStolenPlotMap(groups, logs) {
@@ -1095,7 +1095,7 @@
     return `
       <div class="friend-monitor-summary">
         ${buildSummaryCard("好友数", String(state.summary.friendCount), "已抓好友列表总数")}
-        ${buildSummaryCard("批次数", String(state.summary.batchCount), "同种且同一成熟秒的地块会合并成一批")}
+        ${buildSummaryCard("批次数", String(state.summary.batchCount), "同种且同一分钟成熟的地块会合并成一批")}
         ${buildSummaryCard("已成熟", String(state.summary.matureCount), "当前已经成熟的批次")}
         ${buildSummaryCard("1小时内成熟", String(state.summary.soonCount), "方便卡点去偷")}
         ${buildSummaryCard("本轮有人偷过", String(state.summary.stolenCount), "当前轮日志已经出现偷取记录的批次")}
