@@ -23,7 +23,7 @@
     mobileBreakpoint: 900,
     desktopMargin: 16,
     mobileMargin: 12,
-    mobileCompactHeightRatio: 0.72,
+    mobileCompactHeightRatio: 0.84,
     mobileExpandedHeightRatio: 0.92,
     launcherBottom: 72,
     defaultWindowWidth: 1120,
@@ -54,7 +54,7 @@
   const DEFAULT_UI_STATE = Object.freeze({
     open: false,
     filter: "all",
-    mobileWindowMode: "compact",
+    mobileWindowMode: "expanded",
   });
 
   const MOBILE_WINDOW_MODE = Object.freeze({
@@ -608,6 +608,7 @@
 
   function render() {
     const panel = ensurePanel();
+    const renderState = captureRenderState(panel);
     panel.innerHTML = buildPanelHtml();
 
     const launcherButton = panel.querySelector(`#${APP_CONFIG.launcherId}`);
@@ -692,6 +693,27 @@
     }
 
     observeWindowResize(windowElement);
+    restoreRenderState(panel, renderState);
+  }
+
+  function captureRenderState(panel) {
+    const bodyElement = panel.querySelector(".friend-monitor-body");
+    return {
+      bodyScrollTop: bodyElement ? bodyElement.scrollTop : 0,
+    };
+  }
+
+  function restoreRenderState(panel, renderState) {
+    if (!renderState) {
+      return;
+    }
+
+    const bodyElement = panel.querySelector(".friend-monitor-body");
+    if (!bodyElement) {
+      return;
+    }
+
+    bodyElement.scrollTop = renderState.bodyScrollTop;
   }
 
   function ensurePanel() {
@@ -1184,13 +1206,7 @@
 
   function buildPanelHtml() {
     const rows = getFilteredRows();
-    const mainBlock = [
-      buildFilterHtml(),
-      buildSummaryHtml(),
-      state.isLoading ? `<div class="friend-monitor-state">正在抓好友农场、偷菜日志和体力状态，请等一下。</div>` : "",
-      state.error ? `<div class="friend-monitor-error">数据加载失败：${escapeHtml(state.error)}</div>` : buildRowsHtml(rows),
-      buildFootnoteHtml(),
-    ].join("");
+    const mainBlock = buildMainBlockHtml(rows);
 
     const mobileSizeButtonHtml = isMobileViewport()
       ? `
@@ -1233,6 +1249,17 @@
         <div class="friend-monitor-body">${mainBlock}</div>
       </div>
     `;
+  }
+
+  function buildMainBlockHtml(rows) {
+    const statusBlock = state.isLoading ? `<div class="friend-monitor-state">正在抓好友农场、偷菜日志和体力状态，请等一下。</div>` : "";
+    const rowsBlock = state.error ? `<div class="friend-monitor-error">数据加载失败：${escapeHtml(state.error)}</div>` : buildRowsHtml(rows);
+
+    if (isMobileViewport()) {
+      return [buildFilterHtml(), statusBlock, rowsBlock, buildSummaryHtml(), buildFootnoteHtml()].join("");
+    }
+
+    return [buildFilterHtml(), buildSummaryHtml(), statusBlock, rowsBlock, buildFootnoteHtml()].join("");
   }
 
   function buildFilterHtml() {
@@ -1453,7 +1480,7 @@
   }
 
   function normalizeMobileWindowMode(modeValue) {
-    return modeValue === MOBILE_WINDOW_MODE.expanded ? MOBILE_WINDOW_MODE.expanded : MOBILE_WINDOW_MODE.compact;
+    return modeValue === MOBILE_WINDOW_MODE.compact ? MOBILE_WINDOW_MODE.compact : MOBILE_WINDOW_MODE.expanded;
   }
 
   function resolveMobileWindowHeight(modeValue) {
