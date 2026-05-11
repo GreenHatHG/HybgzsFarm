@@ -20,8 +20,11 @@
     logPageSize: 20,
     maxLogPages: 3,
     soonWindowSeconds: 3600,
+    mobileBreakpoint: 900,
     desktopMargin: 16,
     mobileMargin: 12,
+    mobileCompactHeightRatio: 0.72,
+    mobileExpandedHeightRatio: 0.92,
     launcherBottom: 72,
     defaultWindowWidth: 1120,
     defaultWindowHeight: 780,
@@ -31,6 +34,7 @@
     styleId: "farm-friend-monitor-style",
     launcherId: "farm-friend-monitor-launcher",
     refreshButtonId: "farm-friend-monitor-refresh",
+    mobileSizeButtonId: "farm-friend-monitor-mobile-size",
     closeButtonId: "farm-friend-monitor-close",
     windowId: "farm-friend-monitor-window",
     dragHandleId: "farm-friend-monitor-drag-handle",
@@ -50,6 +54,12 @@
   const DEFAULT_UI_STATE = Object.freeze({
     open: false,
     filter: "all",
+    mobileWindowMode: "compact",
+  });
+
+  const MOBILE_WINDOW_MODE = Object.freeze({
+    compact: "compact",
+    expanded: "expanded",
   });
 
   const state = {
@@ -65,6 +75,7 @@
   let loadToken = 0;
   let resizeObserver = null;
   let dragState = null;
+  let expandedRowId = "";
 
   function bootstrap() {
     if (booted) {
@@ -620,6 +631,14 @@
       });
     }
 
+    const mobileSizeButton = panel.querySelector(`#${APP_CONFIG.mobileSizeButtonId}`);
+    if (mobileSizeButton) {
+      mobileSizeButton.addEventListener("click", () => {
+        toggleMobileWindowMode();
+        render();
+      });
+    }
+
     const closeButton = panel.querySelector(`#${APP_CONFIG.closeButtonId}`);
     if (closeButton) {
       closeButton.addEventListener("click", () => {
@@ -635,6 +654,14 @@
           return;
         }
         setUiState({ filter: filterId }, true);
+        render();
+      });
+    });
+
+    panel.querySelectorAll("[data-toggle-row-id]").forEach((button) => {
+      button.addEventListener("click", () => {
+        const rowId = String(button.getAttribute("data-toggle-row-id") ?? "");
+        expandedRowId = expandedRowId === rowId ? "" : rowId;
         render();
       });
     });
@@ -830,6 +857,7 @@
         display: flex;
         flex-direction: column;
         gap: 16px;
+        -webkit-overflow-scrolling: touch;
       }
 
       .friend-monitor-filters,
@@ -926,6 +954,8 @@
         border-radius: 18px;
         border: 1px solid rgba(111, 146, 89, 0.14);
         background: rgba(255, 255, 255, 0.86);
+        -webkit-overflow-scrolling: touch;
+        touch-action: pan-x pan-y;
       }
 
       .friend-monitor-table {
@@ -1011,14 +1041,139 @@
         cursor: pointer;
       }
 
-      @media (max-width: 900px) {
+      .friend-monitor-mobile-list {
+        display: flex;
+        flex-direction: column;
+        gap: 12px;
+      }
+
+      .friend-monitor-mobile-card {
+        border-radius: 18px;
+        border: 1px solid rgba(104, 137, 91, 0.14);
+        background: rgba(255, 255, 255, 0.86);
+        overflow: hidden;
+      }
+
+      .friend-monitor-mobile-card.is-dim {
+        color: #71836c;
+      }
+
+      .friend-monitor-mobile-toggle {
+        width: 100%;
+        border: 0;
+        padding: 14px;
+        background: transparent;
+        color: inherit;
+        display: flex;
+        align-items: flex-start;
+        justify-content: space-between;
+        gap: 12px;
+        text-align: left;
+        cursor: pointer;
+      }
+
+      .friend-monitor-mobile-main {
+        flex: 1 1 auto;
+        min-width: 0;
+        display: flex;
+        flex-direction: column;
+        gap: 10px;
+      }
+
+      .friend-monitor-mobile-head {
+        display: flex;
+        align-items: flex-start;
+        justify-content: space-between;
+        gap: 12px;
+      }
+
+      .friend-monitor-mobile-meta {
+        display: flex;
+        flex-wrap: wrap;
+        gap: 8px;
+        color: #5c7656;
+        font-size: 12px;
+      }
+
+      .friend-monitor-mobile-chevron {
+        flex: 0 0 auto;
+        align-self: center;
+        color: #5a7154;
+        font-size: 12px;
+        font-weight: 700;
+      }
+
+      .friend-monitor-mobile-details {
+        padding: 0 14px 14px;
+        display: flex;
+        flex-direction: column;
+        gap: 12px;
+      }
+
+      .friend-monitor-detail-grid {
+        display: grid;
+        grid-template-columns: repeat(2, minmax(0, 1fr));
+        gap: 10px;
+      }
+
+      .friend-monitor-detail-item {
+        padding: 10px 12px;
+        border-radius: 14px;
+        background: rgba(248, 252, 244, 0.92);
+        border: 1px solid rgba(104, 137, 91, 0.1);
+      }
+
+      .friend-monitor-detail-item span {
+        display: block;
+        margin-bottom: 6px;
+        color: #68855f;
+        font-size: 11px;
+      }
+
+      .friend-monitor-detail-item strong {
+        display: block;
+        font-size: 13px;
+        line-height: 1.4;
+        word-break: break-word;
+      }
+
+      .friend-monitor-link-row {
+        display: flex;
+        justify-content: flex-start;
+      }
+
+      @media (max-width: ${APP_CONFIG.mobileBreakpoint}px) {
         .friend-monitor-launcher {
           right: ${APP_CONFIG.mobileMargin}px;
           bottom: ${APP_CONFIG.launcherBottom}px;
         }
 
+        .friend-monitor-window {
+          resize: none;
+          border-radius: 20px;
+        }
+
         .friend-monitor-bar,
         .friend-monitor-actions {
+          flex-direction: column;
+          align-items: stretch;
+        }
+
+        .friend-monitor-body {
+          padding: 14px;
+          gap: 14px;
+        }
+
+        .friend-monitor-filters {
+          grid-template-columns: repeat(2, minmax(0, 1fr));
+        }
+
+        .friend-monitor-summary,
+        .friend-monitor-detail-grid {
+          grid-template-columns: 1fr;
+        }
+
+        .friend-monitor-mobile-head {
           flex-direction: column;
           align-items: stretch;
         }
@@ -1033,9 +1188,17 @@
       buildFilterHtml(),
       buildSummaryHtml(),
       state.isLoading ? `<div class="friend-monitor-state">正在抓好友农场、偷菜日志和体力状态，请等一下。</div>` : "",
-      state.error ? `<div class="friend-monitor-error">数据加载失败：${escapeHtml(state.error)}</div>` : buildTableHtml(rows),
+      state.error ? `<div class="friend-monitor-error">数据加载失败：${escapeHtml(state.error)}</div>` : buildRowsHtml(rows),
       buildFootnoteHtml(),
     ].join("");
+
+    const mobileSizeButtonHtml = isMobileViewport()
+      ? `
+            <button id="${APP_CONFIG.mobileSizeButtonId}" class="friend-monitor-button secondary" type="button">
+              ${uiState.mobileWindowMode === MOBILE_WINDOW_MODE.expanded ? "半屏" : "全屏"}
+            </button>
+          `
+      : "";
 
     return `
       <button
@@ -1058,6 +1221,7 @@
           </div>
           <div class="friend-monitor-actions">
             <span class="friend-monitor-time">${state.updatedAt ? `更新 ${escapeHtml(state.updatedAt)}` : "还没抓到数据"}</span>
+            ${mobileSizeButtonHtml}
             <button id="${APP_CONFIG.refreshButtonId}" class="friend-monitor-button" type="button" ${state.isLoading ? "disabled" : ""}>
               ${state.isLoading ? "刷新中..." : "刷新"}
             </button>
@@ -1110,6 +1274,86 @@
         <span>${escapeHtml(label)}</span>
         <strong>${escapeHtml(value)}</strong>
         <em>${escapeHtml(tip)}</em>
+      </div>
+    `;
+  }
+
+  function buildRowsHtml(rows) {
+    syncExpandedRowId(rows);
+    return isMobileViewport() ? buildMobileListHtml(rows) : buildTableHtml(rows);
+  }
+
+  function syncExpandedRowId(rows) {
+    if (expandedRowId && !rows.some((row) => row.id === expandedRowId)) {
+      expandedRowId = "";
+    }
+  }
+
+  function buildMobileListHtml(rows) {
+    if (rows.length === 0 && !state.isLoading) {
+      return `<div class="friend-monitor-empty">当前筛选下还没有可展示的好友批次。</div>`;
+    }
+
+    return `<div class="friend-monitor-mobile-list">${rows.map((row) => buildMobileCardHtml(row)).join("")}</div>`;
+  }
+
+  function buildMobileCardHtml(row) {
+    const clueText = buildClueText(row);
+    const isExpanded = expandedRowId === row.id;
+    const detailBlock = isExpanded
+      ? `
+          <div class="friend-monitor-mobile-details">
+            <div class="friend-monitor-detail-grid">
+              ${buildDetailItemHtml("好友", row.friendName)}
+              ${buildDetailItemHtml("好友标识", row.friendId.slice(0, 8))}
+              ${buildDetailItemHtml("作物", row.seedName)}
+              ${buildDetailItemHtml("地块", `${row.plotCount} 块`)}
+              ${buildDetailItemHtml("状态", row.statusText)}
+              ${buildDetailItemHtml("成熟时间", formatDateTime(row.maturesAtMs))}
+              ${buildDetailItemHtml("当前轮线索", clueText)}
+            </div>
+            <div class="friend-monitor-link-row">
+              <button type="button" class="friend-monitor-link" data-open-friend-url="${escapeHtml(row.friendPageUrl)}">
+                打开好友页
+              </button>
+            </div>
+          </div>
+        `
+      : "";
+
+    return `
+      <article class="friend-monitor-mobile-card ${row.isMature ? "" : "is-dim"}">
+        <button
+          type="button"
+          class="friend-monitor-mobile-toggle"
+          data-toggle-row-id="${escapeHtml(row.id)}"
+          aria-expanded="${isExpanded ? "true" : "false"}"
+        >
+          <div class="friend-monitor-mobile-main">
+            <div class="friend-monitor-mobile-head">
+              <div class="friend-monitor-name">
+                <strong>${escapeHtml(row.friendName)}</strong>
+                <span class="friend-monitor-tip">${escapeHtml(row.seedName)}</span>
+              </div>
+              <span class="friend-monitor-badge ${escapeHtml(row.statusKey)}">${escapeHtml(row.statusText)}</span>
+            </div>
+            <div class="friend-monitor-mobile-meta">
+              <span>${escapeHtml(`${row.plotCount} 块`)}</span>
+              <span>${escapeHtml(formatDateTime(row.maturesAtMs))}</span>
+            </div>
+          </div>
+          <span class="friend-monitor-mobile-chevron">${isExpanded ? "收起详情" : "展开详情"}</span>
+        </button>
+        ${detailBlock}
+      </article>
+    `;
+  }
+
+  function buildDetailItemHtml(label, value) {
+    return `
+      <div class="friend-monitor-detail-item">
+        <span>${escapeHtml(label)}</span>
+        <strong>${escapeHtml(value)}</strong>
       </div>
     `;
   }
@@ -1204,8 +1448,40 @@
     }
   }
 
+  function isMobileViewport() {
+    return window.innerWidth <= APP_CONFIG.mobileBreakpoint;
+  }
+
+  function normalizeMobileWindowMode(modeValue) {
+    return modeValue === MOBILE_WINDOW_MODE.expanded ? MOBILE_WINDOW_MODE.expanded : MOBILE_WINDOW_MODE.compact;
+  }
+
+  function resolveMobileWindowHeight(modeValue) {
+    const heightRatio =
+      normalizeMobileWindowMode(modeValue) === MOBILE_WINDOW_MODE.expanded
+        ? APP_CONFIG.mobileExpandedHeightRatio
+        : APP_CONFIG.mobileCompactHeightRatio;
+    return Math.round(getAvailableWindowHeight() * heightRatio);
+  }
+
   function createDefaultWindowState() {
     const margin = getViewportMargin();
+    if (isMobileViewport()) {
+      const width = getAvailableWindowWidth();
+      const height = clamp(
+        resolveMobileWindowHeight(DEFAULT_UI_STATE.mobileWindowMode),
+        Math.min(APP_CONFIG.minWindowHeight, getAvailableWindowHeight()),
+        getAvailableWindowHeight(),
+      );
+      return {
+        ...DEFAULT_UI_STATE,
+        left: margin,
+        top: Math.max(margin, window.innerHeight - height - margin),
+        width,
+        height,
+      };
+    }
+
     const width = Math.min(APP_CONFIG.defaultWindowWidth, getAvailableWindowWidth());
     const height = Math.min(APP_CONFIG.defaultWindowHeight, getAvailableWindowHeight());
     const left = Math.max(margin, window.innerWidth - width - margin);
@@ -1224,8 +1500,25 @@
     const margin = getViewportMargin();
     const availableWidth = getAvailableWindowWidth();
     const availableHeight = getAvailableWindowHeight();
+    const mobileWindowMode = normalizeMobileWindowMode(nextState.mobileWindowMode);
     const minWidth = Math.min(APP_CONFIG.minWindowWidth, availableWidth);
     const minHeight = Math.min(APP_CONFIG.minWindowHeight, availableHeight);
+
+    if (isMobileViewport()) {
+      const height = clamp(resolveMobileWindowHeight(mobileWindowMode), minHeight, availableHeight);
+      const maxTop = Math.max(margin, window.innerHeight - height - margin);
+
+      return {
+        open: Boolean(nextState.open),
+        filter: normalizeFilter(nextState.filter),
+        mobileWindowMode,
+        left: margin,
+        top: clamp(toFiniteNumber(nextState.top, defaultState.top), margin, maxTop),
+        width: availableWidth,
+        height,
+      };
+    }
+
     const width = clamp(toFiniteNumber(nextState.width, defaultState.width), minWidth, availableWidth);
     const height = clamp(toFiniteNumber(nextState.height, defaultState.height), minHeight, availableHeight);
     const maxLeft = Math.max(margin, window.innerWidth - width - margin);
@@ -1234,6 +1527,7 @@
     return {
       open: Boolean(nextState.open),
       filter: normalizeFilter(nextState.filter),
+      mobileWindowMode,
       left: clamp(toFiniteNumber(nextState.left, defaultState.left), margin, maxLeft),
       top: clamp(toFiniteNumber(nextState.top, defaultState.top), margin, maxTop),
       width,
@@ -1263,6 +1557,7 @@
         APP_CONFIG.storageKey,
         JSON.stringify({
           filter: uiState.filter,
+          mobileWindowMode: uiState.mobileWindowMode,
           left: uiState.left,
           top: uiState.top,
           width: uiState.width,
@@ -1301,11 +1596,13 @@
     const popupWindow = window.open(path, "_blank", "noopener,noreferrer");
     if (popupWindow) {
       popupWindow.opener = null;
+      return;
     }
+    window.location.href = path;
   }
 
   function getViewportMargin() {
-    return window.innerWidth <= 900 ? APP_CONFIG.mobileMargin : APP_CONFIG.desktopMargin;
+    return isMobileViewport() ? APP_CONFIG.mobileMargin : APP_CONFIG.desktopMargin;
   }
 
   function getAvailableWindowWidth() {
@@ -1338,6 +1635,34 @@
   function handleViewportResize() {
     setUiState({}, true);
     applyWindowStyle(document.getElementById(APP_CONFIG.windowId));
+  }
+
+  function toggleMobileWindowMode() {
+    if (!isMobileViewport()) {
+      return;
+    }
+
+    const nextMode =
+      uiState.mobileWindowMode === MOBILE_WINDOW_MODE.expanded
+        ? MOBILE_WINDOW_MODE.compact
+        : MOBILE_WINDOW_MODE.expanded;
+    const nextHeight = clamp(
+      resolveMobileWindowHeight(nextMode),
+      Math.min(APP_CONFIG.minWindowHeight, getAvailableWindowHeight()),
+      getAvailableWindowHeight(),
+    );
+    const margin = getViewportMargin();
+    const currentBottom = uiState.top + uiState.height;
+    const maxTop = Math.max(margin, window.innerHeight - nextHeight - margin);
+    const nextTop = clamp(currentBottom - nextHeight, margin, maxTop);
+
+    setUiState(
+      {
+        mobileWindowMode: nextMode,
+        top: nextTop,
+      },
+      true,
+    );
   }
 
   function syncWindowRectFromElement(windowElement, persist = false) {
@@ -1374,7 +1699,10 @@
   }
 
   function startWindowDrag(event, windowElement) {
-    if (!uiState.open || !windowElement || event.button !== 0) {
+    if (!uiState.open || !windowElement) {
+      return;
+    }
+    if (event.pointerType !== "touch" && event.button !== 0) {
       return;
     }
     if (event.target instanceof Element && event.target.closest("button")) {
@@ -1383,12 +1711,16 @@
 
     const rect = windowElement.getBoundingClientRect();
     dragState = {
+      isMobile: isMobileViewport(),
       pointerId: event.pointerId,
       offsetX: event.clientX - rect.left,
       offsetY: event.clientY - rect.top,
     };
     windowElement.classList.add("is-dragging");
     document.body.style.userSelect = "none";
+    if (event.currentTarget instanceof Element && event.currentTarget.setPointerCapture) {
+      event.currentTarget.setPointerCapture(event.pointerId);
+    }
     event.preventDefault();
   }
 
@@ -1397,13 +1729,16 @@
       return;
     }
 
-    setUiState(
-      {
-        left: event.clientX - dragState.offsetX,
-        top: event.clientY - dragState.offsetY,
-      },
-      false,
-    );
+    const nextPosition = dragState.isMobile
+      ? {
+          top: event.clientY - dragState.offsetY,
+        }
+      : {
+          left: event.clientX - dragState.offsetX,
+          top: event.clientY - dragState.offsetY,
+        };
+
+    setUiState(nextPosition, false);
     applyWindowStyle(document.getElementById(APP_CONFIG.windowId));
   }
 
