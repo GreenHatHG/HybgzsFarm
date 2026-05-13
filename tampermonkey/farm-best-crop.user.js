@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         农场最佳种植助手
 // @namespace    hybgzs-farm-helper
-// @version      0.1.2
+// @version      0.1.3
 // @description  算现在种什么更值
 // @match        https://cdk.hybgzs.com/entertainment/farm*
 // @match        https://cdk.hybgzs.com/entertainment/farm/*
@@ -384,32 +384,38 @@
       return {
         plotBreakEvenRounds: null,
         plotBreakEvenSeconds: null,
+        plotBreakEvenSurplus: null,
       };
     }
     if (!Number.isFinite(row.roundProfit) || !Number.isFinite(row.replantProfit) || row.growthSeconds <= 0) {
       return {
         plotBreakEvenRounds: null,
         plotBreakEvenSeconds: null,
+        plotBreakEvenSurplus: null,
       };
     }
     if (row.roundProfit >= unlockCost) {
       return {
         plotBreakEvenRounds: 1,
         plotBreakEvenSeconds: row.growthSeconds,
+        plotBreakEvenSurplus: row.roundProfit - unlockCost,
       };
     }
     if (row.replantProfit <= 0) {
       return {
         plotBreakEvenRounds: Infinity,
         plotBreakEvenSeconds: Infinity,
+        plotBreakEvenSurplus: null,
       };
     }
 
     const extraRounds = Math.ceil((unlockCost - row.roundProfit) / row.replantProfit);
     const totalRounds = 1 + Math.max(extraRounds, 0);
+    const cumulativeProfit = row.roundProfit + Math.max(totalRounds - 1, 0) * row.replantProfit;
     return {
       plotBreakEvenRounds: totalRounds,
       plotBreakEvenSeconds: totalRounds * row.growthSeconds,
+      plotBreakEvenSurplus: cumulativeProfit - unlockCost,
     };
   }
 
@@ -1500,7 +1506,7 @@
           <div class="farm-helper-card">
             ${mainBlock}
             <div class="farm-helper-footnote">
-              ${escapeHtml(profitTabConfig.footnote)} 预计收菜时间 = 本次刷新时间 + 生长时间。开地回本 = 首轮利润 + 后续每轮续种利润累计覆盖开地成本。菜场没货时按官方价算，菜场顺序不可信，脚本会自己排最低价。
+              ${escapeHtml(profitTabConfig.footnote)} 预计收菜时间 = 本次刷新时间 + 生长时间。收完回本 = 收完这一轮后，累计利润第一次覆盖开地成本。回本当轮结余 = 这一轮收完后，超过开地成本的那部分。菜场没货时按官方价算，菜场顺序不可信，脚本会自己排最低价。
             </div>
           </div>
         </div>
@@ -1586,8 +1592,9 @@
             ${buildMetricHtml("买1个实际总价", formatPurchase(row.buyOneResult))}
             ${buildMetricHtml("单轮利润", formatCoin(row.roundProfit))}
             ${buildMetricHtml("续种利润", formatCoin(row.replantProfit))}
-            ${buildMetricHtml("开地回本时间", formatBreakEvenDuration(row.plotBreakEvenSeconds))}
-            ${buildMetricHtml("开地回本轮数", formatBreakEvenRounds(row.plotBreakEvenRounds))}
+            ${buildMetricHtml("收完回本时间", formatBreakEvenDuration(row.plotBreakEvenSeconds))}
+            ${buildMetricHtml("第几轮收完回本", formatBreakEvenRounds(row.plotBreakEvenRounds))}
+            ${buildMetricHtml("回本当轮结余", formatBreakEvenSurplus(row.plotBreakEvenSurplus))}
             ${buildMetricHtml("预计收菜时间", formatDateTime(row.expectedHarvestAt))}
             ${buildMetricHtml("交易所单价", formatCoin(row.recyclePrice))}
             ${buildMetricHtml("菜场最低单价", formatCoin(row.marketMinUnitPrice))}
@@ -1630,6 +1637,7 @@
     const bestCropText = bestRow ? bestRow.name : "暂时算不出";
     const bestTimeText = bestRow ? formatBreakEvenDuration(bestRow.plotBreakEvenSeconds) : "--";
     const bestRoundsText = bestRow ? formatBreakEvenRounds(bestRow.plotBreakEvenRounds) : "--";
+    const bestSurplusText = bestRow ? formatBreakEvenSurplus(bestRow.plotBreakEvenSurplus) : "--";
 
     return `
       <div class="farm-helper-section">
@@ -1647,10 +1655,10 @@
               <div class="farm-helper-tip">
                 开地成本 ${escapeHtml(formatCoin(summary.nextUnlock.cost))}，${escapeHtml(summary.statusText)}。
               </div>
-              <div class="farm-helper-tip">开地回本按首轮利润 + 后续续种利润累计计算。</div>
+              <div class="farm-helper-tip">回本按收完该轮后的累计利润计算，回本当轮结余会单独显示。</div>
             </div>
             <div class="farm-helper-score">
-              <span>最快回本</span>
+              <span>最快收完回本</span>
               <strong>${escapeHtml(bestTimeText)}</strong>
             </div>
           </div>
@@ -1659,8 +1667,9 @@
             ${buildMetricHtml("地块类型", plotTypeText)}
             ${buildMetricHtml("所需等级", formatLevel(summary.nextUnlock.requiredLevel))}
             ${buildMetricHtml("最快回本作物", bestCropText)}
-            ${buildMetricHtml("最快回本轮数", bestRoundsText)}
-            ${buildMetricHtml("最快回本时间", bestTimeText)}
+            ${buildMetricHtml("第几轮收完回本", bestRoundsText)}
+            ${buildMetricHtml("收完回本时间", bestTimeText)}
+            ${buildMetricHtml("回本当轮结余", bestSurplusText)}
           </div>
         </div>
       </div>
@@ -1704,6 +1713,7 @@
             <td>${escapeHtml(formatCoin(row.replantProfit))}</td>
             <td>${escapeHtml(formatBreakEvenRounds(row.plotBreakEvenRounds))}</td>
             <td>${escapeHtml(formatBreakEvenDuration(row.plotBreakEvenSeconds))}</td>
+            <td>${escapeHtml(formatBreakEvenSurplus(row.plotBreakEvenSurplus))}</td>
             <td>${escapeHtml(formatCoin(row.hourlyProfit))}</td>
             <td>${escapeHtml(formatDateTime(row.expectedHarvestAt))}</td>
             <td>${escapeHtml(formatRatio(row.costPerformance))}</td>
@@ -1734,8 +1744,9 @@
                 <th>买1个实际总价</th>
                 <th>单轮利润</th>
                 <th>续种利润</th>
-                <th>开地回本轮数</th>
-                <th>开地回本时间</th>
+                <th>第几轮收完回本</th>
+                <th>收完回本时间</th>
+                <th>回本当轮结余</th>
                 <th>每小时利润</th>
                 <th>预计收菜时间</th>
                 <th>性价比</th>
@@ -1907,6 +1918,16 @@
       return `${minutes}分`;
     }
     return `${seconds}秒`;
+  }
+
+  function formatBreakEvenSurplus(value) {
+    if (!Number.isFinite(value)) {
+      return "--";
+    }
+    if (value === 0) {
+      return "正好回本";
+    }
+    return formatCoin(value);
   }
 
   function formatDuration(seconds) {
