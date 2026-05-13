@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         农场最佳种植助手
 // @namespace    hybgzs-farm-helper
-// @version      0.1.0
+// @version      0.1.2
 // @description  算现在种什么更值
 // @match        https://cdk.hybgzs.com/entertainment/farm*
 // @match        https://cdk.hybgzs.com/entertainment/farm/*
@@ -44,6 +44,13 @@
   });
 
   const REPLANT_KEEP_QUANTITY = 1;
+  const AVAILABLE_STATUS_KEYS = Object.freeze(["ok", "marketEmptyOfficial"]);
+  const PLOT_UNLOCK_STATUS_TEXT = Object.freeze({
+    ready: "现在可开",
+    noNextUnlock: "地块已全部开完",
+    unavailable: "还没拿到开地数据",
+    levelLocked: "等级不够",
+  });
 
   const PROFIT_TAB = Object.freeze({
     currentRound: "currentRound",
@@ -81,6 +88,7 @@
     isLoading: false,
     error: "",
     rows: [],
+    plotSummary: null,
     recommendedRow: null,
     updatedAt: "",
   };
@@ -125,6 +133,7 @@
         return;
       }
       state.rows = snapshot.rows;
+      state.plotSummary = snapshot.plotSummary;
       state.recommendedRow = snapshot.recommendedRow;
       state.updatedAt = formatTime(snapshot.updatedAt);
       state.error = "";
@@ -134,6 +143,7 @@
       }
       console.error("[farm-best-crop]", error);
       state.rows = [];
+      state.plotSummary = null;
       state.recommendedRow = null;
       state.updatedAt = "";
       state.error = toErrorMessage(error);
@@ -154,11 +164,18 @@
   }
 
   async function collectSnapshot() {
-    const [seeds, recyclePriceMap] = await Promise.all([fetchSeeds(), fetchRecyclePriceMap()]);
+    const [seeds, recyclePriceMap, plotsInfo] = await Promise.all([
+      fetchSeeds(),
+      fetchRecyclePriceMap(),
+      fetchPlotsInfo().catch((error) => {
+        console.warn("[farm-best-crop] plots", error);
+        return null;
+      }),
+    ]);
 
     const marketMap = await fetchMarketMap(seeds);
     const rawRows = await mapWithConcurrency(seeds, APP_CONFIG.marketFetchConcurrency, async (seed) =>
-      buildCropRow(seed, recyclePriceMap.get(seed.id) ?? null, marketMap.get(seed.id)),
+      buildCropRow(seed, recyclePriceMap.get(seed.id) ?? null, marketMap.get(seed.id), plotsInfo?.nextUnlock ?? null),
     );
     const updatedAt = Date.now();
     const rows = rawRows.map((row) => ({
@@ -166,10 +183,12 @@
       expectedHarvestAt: buildExpectedHarvestAt(updatedAt, row.growthSeconds),
     }));
     const sortedRows = sortRows(rows, uiState.profitTab);
+    const plotSummary = buildPlotSummary(rows, plotsInfo);
     const recommendedRow = getRecommendedRow(sortedRows, uiState.profitTab);
 
     return {
       rows: sortedRows,
+      plotSummary,
       recommendedRow,
       updatedAt: new Date(updatedAt),
     };
@@ -206,6 +225,36 @@
     }
 
     return priceMap;
+  }
+
+  async function fetchPlotsInfo() {
+    const response = await requestJson("/plots");
+    return normalizePlotsInfo(response.data ?? null);
+  }
+
+  function normalizePlotsInfo(data) {
+    if (!data || typeof data !== "object") {
+      return null;
+    }
+
+    const nextUnlockRaw = data.nextUnlock && typeof data.nextUnlock === "object" ? data.nextUnlock : null;
+    const vipPlotStartIndex = toNullableNumber(data.vipPlotStartIndex);
+    const vipPlotEndIndex = toNullableNumber(data.vipPlotEndIndex);
+    const nextUnlock = nextUnlockRaw
+      ? {
+          plotIndex: toNullableNumber(nextUnlockRaw.plotIndex),
+          requiredLevel: toNullableNumber(nextUnlockRaw.requiredLevel),
+          cost: toNullableNumber(nextUnlockRaw.cost),
+          canUnlock: Boolean(nextUnlockRaw.canUnlock),
+        }
+      : null;
+
+    return {
+      nextUnlock,
+      nextUnlockIsVip: nextUnlock ? isVipPlotIndex(nextUnlock.plotIndex, vipPlotStartIndex, vipPlotEndIndex) : false,
+      vipPlotEndIndex,
+      vipPlotStartIndex,
+    };
   }
 
   async function fetchMarketMap(seeds) {
@@ -256,7 +305,7 @@
     return left.id.localeCompare(right.id);
   }
 
-  async function buildCropRow(seed, recyclePrice, marketSnapshot) {
+  async function buildCropRow(seed, recyclePrice, marketSnapshot, nextUnlock) {
     const listings = marketSnapshot?.listings ?? [];
     const marketError = marketSnapshot?.error ?? "";
     const marketTotalQuantity = listings.reduce((sum, item) => sum + item.quantity, 0);
@@ -299,8 +348,7 @@
       buyOneResult,
       marketTotalQuantity,
     });
-
-    return {
+    const row = {
       seedId: seed.id,
       name: seed.name,
       isVipOnly: seed.isVipOnly,
@@ -321,6 +369,47 @@
       officialDiff,
       statusKey: status.key,
       statusText: status.text,
+    };
+    const plotBreakEven = buildPlotBreakEven(row, nextUnlock);
+
+    return {
+      ...row,
+      ...plotBreakEven,
+    };
+  }
+
+  function buildPlotBreakEven(row, nextUnlock) {
+    const unlockCost = nextUnlock?.cost;
+    if (!Number.isFinite(unlockCost) || !isAvailableCropRow(row)) {
+      return {
+        plotBreakEvenRounds: null,
+        plotBreakEvenSeconds: null,
+      };
+    }
+    if (!Number.isFinite(row.roundProfit) || !Number.isFinite(row.replantProfit) || row.growthSeconds <= 0) {
+      return {
+        plotBreakEvenRounds: null,
+        plotBreakEvenSeconds: null,
+      };
+    }
+    if (row.roundProfit >= unlockCost) {
+      return {
+        plotBreakEvenRounds: 1,
+        plotBreakEvenSeconds: row.growthSeconds,
+      };
+    }
+    if (row.replantProfit <= 0) {
+      return {
+        plotBreakEvenRounds: Infinity,
+        plotBreakEvenSeconds: Infinity,
+      };
+    }
+
+    const extraRounds = Math.ceil((unlockCost - row.roundProfit) / row.replantProfit);
+    const totalRounds = 1 + Math.max(extraRounds, 0);
+    return {
+      plotBreakEvenRounds: totalRounds,
+      plotBreakEvenSeconds: totalRounds * row.growthSeconds,
     };
   }
 
@@ -502,8 +591,7 @@
   }
 
   function isRecommendedCandidate(row, profitTab = uiState.profitTab) {
-    const isAvailable = row.statusKey === "ok" || row.statusKey === "marketEmptyOfficial";
-    return isAvailable && Number.isFinite(getProfitMetricValue(row, profitTab));
+    return isAvailableCropRow(row) && Number.isFinite(getProfitMetricValue(row, profitTab));
   }
 
   function getProfitMetricValue(row, profitTab = uiState.profitTab) {
@@ -524,6 +612,73 @@
 
   function normalizeProfitTab(profitTab) {
     return PROFIT_TAB_OPTIONS.some((option) => option.id === profitTab) ? profitTab : DEFAULT_PROFIT_TAB;
+  }
+
+  function isAvailableCropRow(row) {
+    return AVAILABLE_STATUS_KEYS.includes(row.statusKey);
+  }
+
+  function buildPlotSummary(rows, plotsInfo) {
+    if (!plotsInfo) {
+      return {
+        bestRow: null,
+        nextUnlock: null,
+        nextUnlockIsVip: false,
+        statusText: PLOT_UNLOCK_STATUS_TEXT.unavailable,
+      };
+    }
+
+    return {
+      bestRow: getBestPlotBreakEvenRow(rows),
+      nextUnlock: plotsInfo.nextUnlock,
+      nextUnlockIsVip: plotsInfo.nextUnlockIsVip,
+      statusText: getPlotUnlockStatusText(plotsInfo.nextUnlock),
+    };
+  }
+
+  function getBestPlotBreakEvenRow(rows) {
+    return rows
+      .filter((row) => isAvailableCropRow(row) && Number.isFinite(row.plotBreakEvenSeconds))
+      .sort(compareRowsByPlotBreakEven)[0] ?? null;
+  }
+
+  function compareRowsByPlotBreakEven(left, right) {
+    const secondDiff = compareFiniteAsc(left.plotBreakEvenSeconds, right.plotBreakEvenSeconds);
+    if (secondDiff !== 0) {
+      return secondDiff;
+    }
+
+    const roundDiff = compareFiniteAsc(left.plotBreakEvenRounds, right.plotBreakEvenRounds);
+    if (roundDiff !== 0) {
+      return roundDiff;
+    }
+
+    const replantProfitDiff = compareFiniteDesc(left.replantProfit, right.replantProfit);
+    if (replantProfitDiff !== 0) {
+      return replantProfitDiff;
+    }
+
+    return left.name.localeCompare(right.name, "zh-CN");
+  }
+
+  function getPlotUnlockStatusText(nextUnlock) {
+    if (!nextUnlock) {
+      return PLOT_UNLOCK_STATUS_TEXT.noNextUnlock;
+    }
+    if (nextUnlock.canUnlock) {
+      return PLOT_UNLOCK_STATUS_TEXT.ready;
+    }
+    if (Number.isFinite(nextUnlock.requiredLevel)) {
+      return `${nextUnlock.requiredLevel}级可开`;
+    }
+    return PLOT_UNLOCK_STATUS_TEXT.levelLocked;
+  }
+
+  function isVipPlotIndex(plotIndex, vipPlotStartIndex, vipPlotEndIndex) {
+    if (!Number.isFinite(plotIndex) || !Number.isFinite(vipPlotStartIndex) || !Number.isFinite(vipPlotEndIndex)) {
+      return false;
+    }
+    return plotIndex >= vipPlotStartIndex && plotIndex <= vipPlotEndIndex;
   }
 
   function applyCurrentProfitTab() {
@@ -1084,6 +1239,11 @@
         border: 1px solid rgba(111, 146, 89, 0.18);
       }
 
+      .farm-helper-recommend.plot-unlock {
+        background: linear-gradient(145deg, rgba(236, 247, 255, 0.98), rgba(244, 252, 247, 0.98));
+        border-color: rgba(98, 141, 122, 0.18);
+      }
+
       .farm-helper-hero {
         display: flex;
         align-items: flex-start;
@@ -1199,7 +1359,7 @@
       .farm-helper-table {
         width: 100%;
         border-collapse: collapse;
-        min-width: 1320px;
+        min-width: 1520px;
         font-size: 12px;
       }
 
@@ -1300,6 +1460,7 @@
     const profitTabConfig = getProfitTabConfig();
     const mainBlock = [
       buildProfitTabHtml(profitTabConfig),
+      buildPlotUnlockHtml(),
       state.isLoading ? `<div class="farm-helper-state">正在抓接口并计算，请等一下。</div>` : "",
       state.error
         ? `<div class="farm-helper-error">数据加载失败：${escapeHtml(state.error)}</div>`
@@ -1339,7 +1500,7 @@
           <div class="farm-helper-card">
             ${mainBlock}
             <div class="farm-helper-footnote">
-              ${escapeHtml(profitTabConfig.footnote)} 预计收菜时间 = 本次刷新时间 + 生长时间。菜场没货时按官方价算，菜场顺序不可信，脚本会自己排最低价。
+              ${escapeHtml(profitTabConfig.footnote)} 预计收菜时间 = 本次刷新时间 + 生长时间。开地回本 = 首轮利润 + 后续每轮续种利润累计覆盖开地成本。菜场没货时按官方价算，菜场顺序不可信，脚本会自己排最低价。
             </div>
           </div>
         </div>
@@ -1425,6 +1586,8 @@
             ${buildMetricHtml("买1个实际总价", formatPurchase(row.buyOneResult))}
             ${buildMetricHtml("单轮利润", formatCoin(row.roundProfit))}
             ${buildMetricHtml("续种利润", formatCoin(row.replantProfit))}
+            ${buildMetricHtml("开地回本时间", formatBreakEvenDuration(row.plotBreakEvenSeconds))}
+            ${buildMetricHtml("开地回本轮数", formatBreakEvenRounds(row.plotBreakEvenRounds))}
             ${buildMetricHtml("预计收菜时间", formatDateTime(row.expectedHarvestAt))}
             ${buildMetricHtml("交易所单价", formatCoin(row.recyclePrice))}
             ${buildMetricHtml("菜场最低单价", formatCoin(row.marketMinUnitPrice))}
@@ -1440,6 +1603,66 @@
       <div class="farm-helper-metric">
         <span>${escapeHtml(label)}</span>
         <strong>${escapeHtml(value)}</strong>
+      </div>
+    `;
+  }
+
+  function buildPlotUnlockHtml() {
+    const summary = state.plotSummary;
+    if (!summary) {
+      return "";
+    }
+
+    if (!summary.nextUnlock) {
+      return `
+        <div class="farm-helper-section">
+          <div class="farm-helper-section-head">
+            <h3>下一块地</h3>
+            <span class="farm-helper-tip">${escapeHtml(summary.statusText)}</span>
+          </div>
+        </div>
+      `;
+    }
+
+    const bestRow = summary.bestRow;
+    const plotIndexText = Number.isFinite(summary.nextUnlock.plotIndex) ? `第 ${summary.nextUnlock.plotIndex} 块` : "下一块";
+    const plotTypeText = summary.nextUnlockIsVip ? "VIP地块" : "普通地块";
+    const bestCropText = bestRow ? bestRow.name : "暂时算不出";
+    const bestTimeText = bestRow ? formatBreakEvenDuration(bestRow.plotBreakEvenSeconds) : "--";
+    const bestRoundsText = bestRow ? formatBreakEvenRounds(bestRow.plotBreakEvenRounds) : "--";
+
+    return `
+      <div class="farm-helper-section">
+        <div class="farm-helper-section-head">
+          <h3>下一块地</h3>
+          <span class="farm-helper-tip">${escapeHtml(summary.statusText)}</span>
+        </div>
+        <div class="farm-helper-recommend plot-unlock">
+          <div class="farm-helper-hero">
+            <div>
+              <div class="farm-helper-name">
+                <strong>${escapeHtml(plotIndexText)}</strong>
+                <span class="farm-helper-pill ${summary.nextUnlockIsVip ? "vip" : ""}">${escapeHtml(plotTypeText)}</span>
+              </div>
+              <div class="farm-helper-tip">
+                开地成本 ${escapeHtml(formatCoin(summary.nextUnlock.cost))}，${escapeHtml(summary.statusText)}。
+              </div>
+              <div class="farm-helper-tip">开地回本按首轮利润 + 后续续种利润累计计算。</div>
+            </div>
+            <div class="farm-helper-score">
+              <span>最快回本</span>
+              <strong>${escapeHtml(bestTimeText)}</strong>
+            </div>
+          </div>
+          <div class="farm-helper-metrics">
+            ${buildMetricHtml("开地成本", formatCoin(summary.nextUnlock.cost))}
+            ${buildMetricHtml("地块类型", plotTypeText)}
+            ${buildMetricHtml("所需等级", formatLevel(summary.nextUnlock.requiredLevel))}
+            ${buildMetricHtml("最快回本作物", bestCropText)}
+            ${buildMetricHtml("最快回本轮数", bestRoundsText)}
+            ${buildMetricHtml("最快回本时间", bestTimeText)}
+          </div>
+        </div>
       </div>
     `;
   }
@@ -1462,7 +1685,7 @@
         const buyOneTone = getPurchaseTone(row.buyOneResult, row.officialSeedPrice, 1);
         const officialDiffTone = getOfficialDiffTone(row.officialDiff);
         return `
-          <tr class="${row.statusKey === "ok" || row.statusKey === "marketEmptyOfficial" ? "" : "is-dim"}">
+          <tr class="${isAvailableCropRow(row) ? "" : "is-dim"}">
             <td>${index + 1}</td>
             <td>
               <div class="farm-helper-name">
@@ -1479,6 +1702,8 @@
             <td>${buildTableValue(formatPurchase(row.buyOneResult), buyOneTone)}</td>
             <td>${escapeHtml(formatCoin(row.roundProfit))}</td>
             <td>${escapeHtml(formatCoin(row.replantProfit))}</td>
+            <td>${escapeHtml(formatBreakEvenRounds(row.plotBreakEvenRounds))}</td>
+            <td>${escapeHtml(formatBreakEvenDuration(row.plotBreakEvenSeconds))}</td>
             <td>${escapeHtml(formatCoin(row.hourlyProfit))}</td>
             <td>${escapeHtml(formatDateTime(row.expectedHarvestAt))}</td>
             <td>${escapeHtml(formatRatio(row.costPerformance))}</td>
@@ -1509,6 +1734,8 @@
                 <th>买1个实际总价</th>
                 <th>单轮利润</th>
                 <th>续种利润</th>
+                <th>开地回本轮数</th>
+                <th>开地回本时间</th>
                 <th>每小时利润</th>
                 <th>预计收菜时间</th>
                 <th>性价比</th>
@@ -1646,6 +1873,42 @@
     });
   }
 
+  function formatBreakEvenRounds(value) {
+    if (value === Infinity) {
+      return "回不了本";
+    }
+    if (!Number.isFinite(value)) {
+      return "--";
+    }
+    return `${value}轮`;
+  }
+
+  function formatBreakEvenDuration(seconds) {
+    if (seconds === Infinity) {
+      return "回不了本";
+    }
+    if (!Number.isFinite(seconds)) {
+      return "--";
+    }
+
+    const totalMinutes = Math.ceil(seconds / 60);
+    const days = Math.floor(totalMinutes / 1440);
+    const remainingMinutes = totalMinutes % 1440;
+    const hours = Math.floor(remainingMinutes / 60);
+    const minutes = remainingMinutes % 60;
+
+    if (days > 0) {
+      return hours > 0 ? `${days}天${hours}小时` : `${days}天`;
+    }
+    if (hours > 0) {
+      return minutes > 0 ? `${hours}小时${minutes}分` : `${hours}小时`;
+    }
+    if (minutes > 0) {
+      return `${minutes}分`;
+    }
+    return `${seconds}秒`;
+  }
+
   function formatDuration(seconds) {
     if (!Number.isFinite(seconds)) {
       return "--";
@@ -1704,9 +1967,21 @@
     return Number.isFinite(numberValue) ? numberValue : 0;
   }
 
+  function toNullableNumber(value) {
+    const numberValue = Number(value);
+    return Number.isFinite(numberValue) ? numberValue : null;
+  }
+
   function toFiniteNumber(value, fallbackValue) {
     const numberValue = Number(value);
     return Number.isFinite(numberValue) ? numberValue : fallbackValue;
+  }
+
+  function formatLevel(value) {
+    if (!Number.isFinite(value)) {
+      return "--";
+    }
+    return `${value}级`;
   }
 
   function clamp(value, minValue, maxValue) {
