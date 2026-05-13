@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         农场好友总览助手
 // @namespace    hybgzs-farm-helper
-// @version      0.1.0
+// @version      0.1.2
 // @description  汇总所有好友当前种植情况，显示成熟时间和偷菜前置判断
 // @match        https://cdk.hybgzs.com/entertainment/farm*
 // @match        https://cdk.hybgzs.com/entertainment/farm/*
@@ -40,6 +40,8 @@
     dragHandleId: "farm-friend-monitor-drag-handle",
     storageKey: "farm-friend-monitor-ui-state",
     sessionOpenStateKey: "farm-friend-monitor-open-state",
+    snapshotStateKey: "farm-friend-monitor-data-snapshot",
+    historyStateTabIdKey: "__farmFriendMonitorTabId",
   });
 
   const FILTER_OPTIONS = Object.freeze(
@@ -70,7 +72,9 @@
     summary: null,
   };
 
+  const tabSessionId = ensureTabSessionId();
   const uiState = loadUiState();
+  hydrateStateFromSnapshot();
   let booted = false;
   let loadToken = 0;
   let resizeObserver = null;
@@ -137,6 +141,7 @@
         return;
       }
       state.isLoading = false;
+      saveStateSnapshot();
       render();
     }
   }
@@ -1598,9 +1603,59 @@
     saveOpenState(uiState.open);
   }
 
+  function hydrateStateFromSnapshot() {
+    const snapshot = loadStateSnapshot();
+    if (!snapshot) {
+      return;
+    }
+
+    state.rows = snapshot.rows;
+    state.summary = snapshot.summary;
+    state.updatedAt = snapshot.updatedAt;
+    state.error = snapshot.error;
+  }
+
+  function loadStateSnapshot() {
+    try {
+      const rawValue = sessionStorage.getItem(buildSessionStorageKey(APP_CONFIG.snapshotStateKey));
+      if (!rawValue) {
+        return null;
+      }
+      return normalizeStateSnapshot(JSON.parse(rawValue));
+    } catch (error) {
+      console.warn("[farm-friend-monitor] load-state-snapshot", error);
+      return null;
+    }
+  }
+
+  function saveStateSnapshot() {
+    try {
+      sessionStorage.setItem(
+        buildSessionStorageKey(APP_CONFIG.snapshotStateKey),
+        JSON.stringify({
+          rows: state.rows,
+          summary: state.summary,
+          updatedAt: state.updatedAt,
+          error: state.error,
+        }),
+      );
+    } catch (error) {
+      console.warn("[farm-friend-monitor] save-state-snapshot", error);
+    }
+  }
+
+  function normalizeStateSnapshot(snapshot) {
+    return {
+      rows: Array.isArray(snapshot?.rows) ? snapshot.rows : [],
+      summary: snapshot?.summary && typeof snapshot.summary === "object" ? snapshot.summary : null,
+      updatedAt: typeof snapshot?.updatedAt === "string" ? snapshot.updatedAt : "",
+      error: typeof snapshot?.error === "string" ? snapshot.error : "",
+    };
+  }
+
   function loadOpenState() {
     try {
-      return sessionStorage.getItem(APP_CONFIG.sessionOpenStateKey) === "1";
+      return sessionStorage.getItem(buildSessionStorageKey(APP_CONFIG.sessionOpenStateKey)) === "1";
     } catch (error) {
       console.warn("[farm-friend-monitor] load-open-state", error);
       return DEFAULT_UI_STATE.open;
@@ -1609,14 +1664,58 @@
 
   function saveOpenState(isOpen) {
     try {
+      const storageKey = buildSessionStorageKey(APP_CONFIG.sessionOpenStateKey);
       if (isOpen) {
-        sessionStorage.setItem(APP_CONFIG.sessionOpenStateKey, "1");
+        sessionStorage.setItem(storageKey, "1");
         return;
       }
-      sessionStorage.removeItem(APP_CONFIG.sessionOpenStateKey);
+      sessionStorage.removeItem(storageKey);
     } catch (error) {
       console.warn("[farm-friend-monitor] save-open-state", error);
     }
+  }
+
+  function buildSessionStorageKey(baseKey) {
+    return `${baseKey}:${tabSessionId}`;
+  }
+
+  function ensureTabSessionId() {
+    const existingId = readTabSessionId();
+    if (existingId) {
+      return existingId;
+    }
+
+    const nextId = createTabSessionId();
+    try {
+      const currentState = history.state && typeof history.state === "object" ? history.state : {};
+      history.replaceState(
+        {
+          ...currentState,
+          [APP_CONFIG.historyStateTabIdKey]: nextId,
+        },
+        document.title,
+      );
+    } catch (error) {
+      console.warn("[farm-friend-monitor] save-tab-session-id", error);
+    }
+    return nextId;
+  }
+
+  function readTabSessionId() {
+    try {
+      const tabId = history.state?.[APP_CONFIG.historyStateTabIdKey];
+      return typeof tabId === "string" ? tabId : "";
+    } catch (error) {
+      console.warn("[farm-friend-monitor] load-tab-session-id", error);
+      return "";
+    }
+  }
+
+  function createTabSessionId() {
+    if (typeof crypto !== "undefined" && typeof crypto.randomUUID === "function") {
+      return crypto.randomUUID();
+    }
+    return `${Date.now().toString(36)}${Math.random().toString(36).slice(2, 10)}`;
   }
 
   function openUrlInNewTab(path) {
