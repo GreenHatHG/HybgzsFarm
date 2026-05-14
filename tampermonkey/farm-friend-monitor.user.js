@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         农场好友总览助手
 // @namespace    hybgzs-farm-helper
-// @version      0.1.2
+// @version      0.1.3
 // @description  汇总所有好友当前种植情况，显示成熟时间和偷菜前置判断
 // @match        https://cdk.hybgzs.com/entertainment/farm*
 // @match        https://cdk.hybgzs.com/entertainment/farm/*
@@ -673,7 +673,9 @@
     });
 
     panel.querySelectorAll("[data-open-friend-url]").forEach((button) => {
-      button.addEventListener("click", () => {
+      button.addEventListener("click", (event) => {
+        event.preventDefault();
+        event.stopPropagation();
         const friendUrl = button.getAttribute("data-open-friend-url");
         if (friendUrl) {
           openUrlInNewTab(friendUrl);
@@ -1719,12 +1721,14 @@
   }
 
   function openUrlInNewTab(path) {
-    const popupWindow = window.open(path, "_blank", "noopener,noreferrer");
-    if (popupWindow) {
-      popupWindow.opener = null;
-      return;
-    }
-    window.location.href = path;
+    const link = document.createElement("a");
+    link.href = path;
+    link.target = "_blank";
+    link.rel = "noopener noreferrer";
+    link.style.display = "none";
+    document.body.appendChild(link);
+    link.click();
+    link.remove();
   }
 
   function getViewportMargin() {
