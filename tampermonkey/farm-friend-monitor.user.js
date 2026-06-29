@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         农场好友总览助手
 // @namespace    hybgzs-farm-helper
-// @version      0.1.3
+// @version      0.1.5
 // @description  汇总所有好友当前种植情况，显示成熟时间和偷菜前置判断
 // @match        https://cdk.hybgzs.com/entertainment/farm*
 // @match        https://cdk.hybgzs.com/entertainment/farm/*
@@ -64,6 +64,20 @@
     expanded: "expanded",
   });
 
+  const ROW_SORT_TIER = Object.freeze({
+    ready: 0,
+    grow: 1,
+    warn: 2,
+    done: 2,
+  });
+
+  const ROW_STATUS_PRIORITY = Object.freeze({
+    ready: 0,
+    grow: 0,
+    warn: 0,
+    done: 1,
+  });
+
   const state = {
     isLoading: false,
     error: "",
@@ -79,7 +93,7 @@
   let loadToken = 0;
   let resizeObserver = null;
   let dragState = null;
-  let expandedRowId = "";
+  let expandedFriendId = "";
 
   function bootstrap() {
     if (booted) {
@@ -578,11 +592,18 @@
   }
 
   function compareRows(left, right) {
-    if (left.isMature !== right.isMature) {
-      return Number(left.isMature) - Number(right.isMature);
+    const sortTierDiff = getRowSortTier(left) - getRowSortTier(right);
+    if (sortTierDiff !== 0) {
+      return sortTierDiff;
+    }
+    const statusPriorityDiff = getRowStatusPriority(left) - getRowStatusPriority(right);
+    if (statusPriorityDiff !== 0) {
+      return statusPriorityDiff;
     }
     if (left.maturesAtMs !== right.maturesAtMs) {
-      return left.isMature ? right.maturesAtMs - left.maturesAtMs : left.maturesAtMs - right.maturesAtMs;
+      return getRowSortTier(left) === ROW_SORT_TIER.grow
+        ? left.maturesAtMs - right.maturesAtMs
+        : right.maturesAtMs - left.maturesAtMs;
     }
     if (left.canAttempt !== right.canAttempt) {
       return Number(right.canAttempt) - Number(left.canAttempt);
@@ -592,6 +613,20 @@
       return friendDiff;
     }
     return left.seedName.localeCompare(right.seedName, "zh-CN");
+  }
+
+  function getRowSortTier(row) {
+    if (row.canAttempt) {
+      return ROW_SORT_TIER.ready;
+    }
+    if (!row.isMature) {
+      return ROW_SORT_TIER.grow;
+    }
+    return ROW_SORT_TIER.done;
+  }
+
+  function getRowStatusPriority(row) {
+    return ROW_STATUS_PRIORITY[row.statusKey] ?? ROW_STATUS_PRIORITY.done;
   }
 
   function getFilteredRows() {
@@ -611,9 +646,9 @@
     return row.currentRoundStolenQuantity > 0 || row.currentRoundStolenPlots > 0;
   }
 
-  function render() {
+  function render(nextRenderState = null) {
     const panel = ensurePanel();
-    const renderState = captureRenderState(panel);
+    const renderState = nextRenderState ?? captureRenderState(panel);
     panel.innerHTML = buildPanelHtml();
 
     const launcherButton = panel.querySelector(`#${APP_CONFIG.launcherId}`);
@@ -664,11 +699,12 @@
       });
     });
 
-    panel.querySelectorAll("[data-toggle-row-id]").forEach((button) => {
+    panel.querySelectorAll("[data-toggle-friend-id]").forEach((button) => {
       button.addEventListener("click", () => {
-        const rowId = String(button.getAttribute("data-toggle-row-id") ?? "");
-        expandedRowId = expandedRowId === rowId ? "" : rowId;
-        render();
+        const friendId = String(button.getAttribute("data-toggle-friend-id") ?? "");
+        const toggleRenderState = captureRenderState(panel, button);
+        expandedFriendId = expandedFriendId === friendId ? "" : friendId;
+        render(toggleRenderState);
       });
     });
 
@@ -703,10 +739,18 @@
     restoreRenderState(panel, renderState);
   }
 
-  function captureRenderState(panel) {
+  function captureRenderState(panel, anchorSource = null) {
     const bodyElement = panel.querySelector(".friend-monitor-body");
+    const anchorElement = anchorSource?.closest?.("[data-friend-anchor-id]") ?? null;
+    const anchorFriendId = anchorElement?.getAttribute("data-friend-anchor-id") ?? "";
+    const anchorOffsetTop =
+      bodyElement && anchorElement
+        ? anchorElement.getBoundingClientRect().top - bodyElement.getBoundingClientRect().top
+        : null;
     return {
       bodyScrollTop: bodyElement ? bodyElement.scrollTop : 0,
+      anchorFriendId,
+      anchorOffsetTop: Number.isFinite(anchorOffsetTop) ? anchorOffsetTop : null,
     };
   }
 
@@ -720,7 +764,35 @@
       return;
     }
 
-    bodyElement.scrollTop = renderState.bodyScrollTop;
+    const restoreBodyScroll = () => {
+      bodyElement.scrollTop = renderState.bodyScrollTop;
+
+      if (!renderState.anchorFriendId || !Number.isFinite(renderState.anchorOffsetTop)) {
+        return;
+      }
+
+      const anchorElement = panel.querySelector(buildFriendAnchorSelector(renderState.anchorFriendId));
+      if (!anchorElement) {
+        return;
+      }
+
+      const currentAnchorOffsetTop = anchorElement.getBoundingClientRect().top - bodyElement.getBoundingClientRect().top;
+      bodyElement.scrollTop += currentAnchorOffsetTop - renderState.anchorOffsetTop;
+    };
+
+    restoreBodyScroll();
+    requestAnimationFrame(restoreBodyScroll);
+  }
+
+  function buildFriendAnchorSelector(friendId) {
+    return `[data-friend-anchor-id="${escapeAttributeSelectorValue(friendId)}"]`;
+  }
+
+  function escapeAttributeSelectorValue(value) {
+    if (window.CSS?.escape) {
+      return window.CSS.escape(String(value));
+    }
+    return String(value).replace(/["\\]/g, "\\$&");
   }
 
   function ensurePanel() {
@@ -1070,6 +1142,49 @@
         cursor: pointer;
       }
 
+      .friend-monitor-action-group {
+        display: flex;
+        flex-wrap: wrap;
+        gap: 8px;
+        align-items: center;
+      }
+
+      .friend-monitor-friend-row.is-dim {
+        color: #71836c;
+      }
+
+      .friend-monitor-expand-row td {
+        padding: 0;
+        border-top: 0;
+        background: rgba(245, 250, 240, 0.92);
+      }
+
+      .friend-monitor-expand-panel {
+        padding: 14px;
+        border-top: 1px solid rgba(101, 131, 83, 0.08);
+      }
+
+      .friend-monitor-batch-list {
+        display: flex;
+        flex-direction: column;
+        gap: 10px;
+      }
+
+      .friend-monitor-batch-item {
+        display: grid;
+        grid-template-columns: repeat(5, minmax(0, 1fr));
+        gap: 10px;
+        padding: 12px;
+        border-radius: 16px;
+        background: rgba(255, 255, 255, 0.86);
+        border: 1px solid rgba(104, 137, 91, 0.12);
+      }
+
+      .friend-monitor-batch-item.is-primary {
+        border-color: rgba(91, 139, 69, 0.24);
+        background: rgba(246, 252, 239, 0.96);
+      }
+
       .friend-monitor-mobile-list {
         display: flex;
         flex-direction: column;
@@ -1088,17 +1203,11 @@
       }
 
       .friend-monitor-mobile-toggle {
-        width: 100%;
-        border: 0;
         padding: 14px;
-        background: transparent;
-        color: inherit;
         display: flex;
         align-items: flex-start;
         justify-content: space-between;
         gap: 12px;
-        text-align: left;
-        cursor: pointer;
       }
 
       .friend-monitor-mobile-main {
@@ -1126,10 +1235,10 @@
 
       .friend-monitor-mobile-chevron {
         flex: 0 0 auto;
-        align-self: center;
-        color: #5a7154;
-        font-size: 12px;
-        font-weight: 700;
+        display: flex;
+        flex-wrap: wrap;
+        justify-content: flex-end;
+        gap: 8px;
       }
 
       .friend-monitor-mobile-details {
@@ -1198,13 +1307,22 @@
         }
 
         .friend-monitor-summary,
-        .friend-monitor-detail-grid {
+        .friend-monitor-detail-grid,
+        .friend-monitor-batch-item {
           grid-template-columns: 1fr;
         }
 
         .friend-monitor-mobile-head {
           flex-direction: column;
           align-items: stretch;
+        }
+
+        .friend-monitor-mobile-toggle {
+          flex-direction: column;
+        }
+
+        .friend-monitor-mobile-chevron {
+          justify-content: flex-start;
         }
       }
     `;
@@ -1313,71 +1431,113 @@
   }
 
   function buildRowsHtml(rows) {
-    syncExpandedRowId(rows);
-    return isMobileViewport() ? buildMobileListHtml(rows) : buildTableHtml(rows);
+    const friendGroups = buildFriendGroups(rows);
+    syncExpandedFriendId(friendGroups);
+    return isMobileViewport() ? buildMobileListHtml(friendGroups) : buildTableHtml(friendGroups);
   }
 
-  function syncExpandedRowId(rows) {
-    if (expandedRowId && !rows.some((row) => row.id === expandedRowId)) {
-      expandedRowId = "";
+  function buildFriendGroups(rows) {
+    const friendGroupMap = new Map();
+
+    for (const row of rows) {
+      const currentGroup = friendGroupMap.get(row.friendId) ?? {
+        friendId: row.friendId,
+        friendName: row.friendName,
+        friendPageUrl: row.friendPageUrl,
+        rows: [],
+      };
+      currentGroup.rows.push(row);
+      friendGroupMap.set(row.friendId, currentGroup);
+    }
+
+    return [...friendGroupMap.values()]
+      .map((group) => {
+        const sortedRows = [...group.rows].sort(compareRows);
+        return {
+          ...group,
+          rows: sortedRows,
+          primaryRow: sortedRows[0],
+        };
+      })
+      .sort(compareFriendGroups);
+  }
+
+  function compareFriendGroups(left, right) {
+    const primaryRowDiff = compareRows(left.primaryRow, right.primaryRow);
+    if (primaryRowDiff !== 0) {
+      return primaryRowDiff;
+    }
+    return left.friendName.localeCompare(right.friendName, "zh-CN");
+  }
+
+  function syncExpandedFriendId(friendGroups) {
+    if (expandedFriendId && !friendGroups.some((group) => group.friendId === expandedFriendId)) {
+      expandedFriendId = "";
     }
   }
 
-  function buildMobileListHtml(rows) {
-    if (rows.length === 0 && !state.isLoading) {
+  function buildMobileListHtml(friendGroups) {
+    if (friendGroups.length === 0 && !state.isLoading) {
       return `<div class="friend-monitor-empty">当前筛选下还没有可展示的好友批次。</div>`;
     }
 
-    return `<div class="friend-monitor-mobile-list">${rows.map((row) => buildMobileCardHtml(row)).join("")}</div>`;
+    return `<div class="friend-monitor-mobile-list">${friendGroups.map((group) => buildMobileCardHtml(group)).join("")}</div>`;
   }
 
-  function buildMobileCardHtml(row) {
-    const clueText = buildClueText(row);
-    const isExpanded = expandedRowId === row.id;
+  function buildMobileCardHtml(friendGroup) {
+    const { primaryRow } = friendGroup;
+    const clueText = buildClueText(primaryRow);
+    const isExpanded = expandedFriendId === friendGroup.friendId;
+    const expandButtonHtml =
+      friendGroup.rows.length > 1
+        ? `
+            <button
+              type="button"
+              class="friend-monitor-link"
+              data-toggle-friend-id="${escapeHtml(friendGroup.friendId)}"
+              aria-expanded="${isExpanded ? "true" : "false"}"
+            >
+              ${isExpanded ? "收起" : `展开 ${friendGroup.rows.length} 批`}
+            </button>
+          `
+        : "";
     const detailBlock = isExpanded
       ? `
           <div class="friend-monitor-mobile-details">
-            <div class="friend-monitor-detail-grid">
-              ${buildDetailItemHtml("好友", row.friendName)}
-              ${buildDetailItemHtml("好友标识", row.friendId.slice(0, 8))}
-              ${buildDetailItemHtml("作物", row.seedName)}
-              ${buildDetailItemHtml("地块", `${row.plotCount} 块`)}
-              ${buildDetailItemHtml("状态", row.statusText)}
-              ${buildDetailItemHtml("成熟时间", formatDateTime(row.maturesAtMs))}
-              ${buildDetailItemHtml("当前轮线索", clueText)}
-            </div>
-            <div class="friend-monitor-link-row">
-              <button type="button" class="friend-monitor-link" data-open-friend-url="${escapeHtml(row.friendPageUrl)}">
-                打开好友页
-              </button>
-            </div>
+            ${buildBatchListHtml(friendGroup.rows, primaryRow.id)}
           </div>
         `
       : "";
 
     return `
-      <article class="friend-monitor-mobile-card ${row.isMature ? "" : "is-dim"}">
-        <button
-          type="button"
-          class="friend-monitor-mobile-toggle"
-          data-toggle-row-id="${escapeHtml(row.id)}"
-          aria-expanded="${isExpanded ? "true" : "false"}"
-        >
+      <article
+        class="friend-monitor-mobile-card ${getRowSortTier(primaryRow) === ROW_SORT_TIER.grow ? "is-dim" : ""}"
+        data-friend-anchor-id="${escapeHtml(friendGroup.friendId)}"
+      >
+        <div class="friend-monitor-mobile-toggle">
           <div class="friend-monitor-mobile-main">
             <div class="friend-monitor-mobile-head">
               <div class="friend-monitor-name">
-                <strong>${escapeHtml(row.friendName)}</strong>
-                <span class="friend-monitor-tip">${escapeHtml(row.seedName)}</span>
+                <strong>${escapeHtml(friendGroup.friendName)}</strong>
+                <span class="friend-monitor-tip">${escapeHtml(friendGroup.friendId.slice(0, 8))}</span>
               </div>
-              <span class="friend-monitor-badge ${escapeHtml(row.statusKey)}">${escapeHtml(row.statusText)}</span>
+              <span class="friend-monitor-badge ${escapeHtml(primaryRow.statusKey)}">${escapeHtml(primaryRow.statusText)}</span>
             </div>
             <div class="friend-monitor-mobile-meta">
-              <span>${escapeHtml(`${row.plotCount} 块`)}</span>
-              <span>${escapeHtml(formatDateTime(row.maturesAtMs))}</span>
+              <span>${escapeHtml(primaryRow.seedName)}</span>
+              <span>${escapeHtml(`${primaryRow.plotCount} 块`)}</span>
+              <span>${escapeHtml(`${friendGroup.rows.length} 批`)}</span>
+              <span>${escapeHtml(formatDateTime(primaryRow.maturesAtMs))}</span>
+              <span>${escapeHtml(clueText)}</span>
             </div>
           </div>
-          <span class="friend-monitor-mobile-chevron">${isExpanded ? "收起详情" : "展开详情"}</span>
-        </button>
+          <div class="friend-monitor-mobile-chevron">
+            ${expandButtonHtml}
+            <button type="button" class="friend-monitor-link" data-open-friend-url="${escapeHtml(friendGroup.friendPageUrl)}">
+              打开好友页
+            </button>
+          </div>
+        </div>
         ${detailBlock}
       </article>
     `;
@@ -1392,33 +1552,66 @@
     `;
   }
 
-  function buildTableHtml(rows) {
-    if (rows.length === 0 && !state.isLoading) {
+  function buildTableHtml(friendGroups) {
+    if (friendGroups.length === 0 && !state.isLoading) {
       return `<div class="friend-monitor-empty">当前筛选下还没有可展示的好友批次。</div>`;
     }
 
-    const rowsHtml = rows
-      .map((row) => {
-        const clueText = buildClueText(row);
+    const rowsHtml = friendGroups
+      .map((friendGroup) => {
+        const { primaryRow } = friendGroup;
+        const clueText = buildClueText(primaryRow);
+        const isExpanded = expandedFriendId === friendGroup.friendId;
+        const expandRowHtml = isExpanded
+          ? `
+              <tr class="friend-monitor-expand-row">
+                <td colspan="7">
+                  <div class="friend-monitor-expand-panel">
+                    ${buildBatchListHtml(friendGroup.rows, primaryRow.id)}
+                  </div>
+                </td>
+              </tr>
+            `
+          : "";
         return `
-          <tr class="${row.isMature ? "" : "is-dim"}">
+          <tr
+            class="friend-monitor-friend-row ${getRowSortTier(primaryRow) === ROW_SORT_TIER.grow ? "is-dim" : ""}"
+            data-friend-anchor-id="${escapeHtml(friendGroup.friendId)}"
+          >
             <td>
               <div class="friend-monitor-name">
-                <strong>${escapeHtml(row.friendName)}</strong>
-                <span class="friend-monitor-tip">${escapeHtml(row.friendId.slice(0, 8))}</span>
+                <strong>${escapeHtml(friendGroup.friendName)}</strong>
+                <span class="friend-monitor-tip">${escapeHtml(friendGroup.friendId.slice(0, 8))}</span>
               </div>
             </td>
-            <td>${escapeHtml(row.seedName)}</td>
-            <td>${escapeHtml(`${row.plotCount} 块`)}</td>
-            <td><span class="friend-monitor-badge ${escapeHtml(row.statusKey)}">${escapeHtml(row.statusText)}</span></td>
-            <td>${escapeHtml(formatDateTime(row.maturesAtMs))}</td>
+            <td>${escapeHtml(primaryRow.seedName)}</td>
+            <td>${escapeHtml(`${friendGroup.rows.length} 批`)}</td>
+            <td><span class="friend-monitor-badge ${escapeHtml(primaryRow.statusKey)}">${escapeHtml(primaryRow.statusText)}</span></td>
+            <td>${escapeHtml(formatDateTime(primaryRow.maturesAtMs))}</td>
             <td title="理论余量 = 当前同种未收地块总产量 - 当前轮日志偷取量">${escapeHtml(clueText)}</td>
             <td>
-              <button type="button" class="friend-monitor-link" data-open-friend-url="${escapeHtml(row.friendPageUrl)}">
-                打开好友页
-              </button>
+              <div class="friend-monitor-action-group">
+                ${
+                  friendGroup.rows.length > 1
+                    ? `
+                        <button
+                          type="button"
+                          class="friend-monitor-link"
+                          data-toggle-friend-id="${escapeHtml(friendGroup.friendId)}"
+                          aria-expanded="${isExpanded ? "true" : "false"}"
+                        >
+                          ${isExpanded ? "收起" : `展开 ${friendGroup.rows.length} 批`}
+                        </button>
+                      `
+                    : ""
+                }
+                <button type="button" class="friend-monitor-link" data-open-friend-url="${escapeHtml(friendGroup.friendPageUrl)}">
+                  打开好友页
+                </button>
+              </div>
             </td>
           </tr>
+          ${expandRowHtml}
         `;
       })
       .join("");
@@ -1429,8 +1622,8 @@
           <thead>
             <tr>
               <th>好友</th>
-              <th>作物</th>
-              <th>地块</th>
+              <th>默认展示</th>
+              <th>批次</th>
               <th>状态</th>
               <th>成熟时间</th>
               <th>当前轮线索</th>
@@ -1457,6 +1650,26 @@
       parts.push("约余 --");
     }
     return parts.join(" / ");
+  }
+
+  function buildBatchListHtml(rows, primaryRowId) {
+    return `
+      <div class="friend-monitor-batch-list">
+        ${rows.map((row) => buildBatchItemHtml(row, row.id === primaryRowId)).join("")}
+      </div>
+    `;
+  }
+
+  function buildBatchItemHtml(row, isPrimary) {
+    return `
+      <div class="friend-monitor-batch-item ${isPrimary ? "is-primary" : ""}">
+        ${buildDetailItemHtml("作物", isPrimary ? `${row.seedName} · 默认展示` : row.seedName)}
+        ${buildDetailItemHtml("地块", `${row.plotCount} 块`)}
+        ${buildDetailItemHtml("状态", row.statusText)}
+        ${buildDetailItemHtml("成熟时间", formatDateTime(row.maturesAtMs))}
+        ${buildDetailItemHtml("当前轮线索", buildClueText(row))}
+      </div>
+    `;
   }
 
   function buildFootnoteHtml() {
