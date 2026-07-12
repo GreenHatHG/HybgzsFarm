@@ -89,6 +89,7 @@
   const AUTO_STEAL_RESULT_KIND = Object.freeze({
     success: "success",
     empty: "empty",
+    challenge: "challenge",
     error: "error",
   });
 
@@ -97,6 +98,7 @@
     stopping: "自动偷取停止中，等待当前请求结束",
     running: "自动偷取运行中，每5秒尝试1个好友",
     emptyQueue: "自动偷取运行中，当前没有可偷好友",
+    challenge: "检测到验证页，请先人工处理",
     inFlight: "自动偷取执行中",
   });
 
@@ -122,6 +124,7 @@
     inFlight: false,
     cursor: 0,
     recentResults: [],
+    challengeRequired: false,
   };
 
   const friendStealVerdictMap = new Map();
@@ -156,10 +159,9 @@
   }
 
   function maybeLoadDataForOpenWindow() {
-    if (!uiState.open || state.isLoading || state.updatedAt || state.error) {
+    if (!uiState.open || state.isLoading) {
       return;
     }
-    void loadData();
   }
 
   async function loadData() {
@@ -182,6 +184,7 @@
       state.summary = snapshot.summary;
       state.updatedAt = formatTime(snapshot.updatedAt);
       state.error = "";
+      autoStealState.challengeRequired = false;
     } catch (error) {
       if (currentToken !== loadToken) {
         return;
@@ -273,7 +276,7 @@
     }
   }
 
-  async function buildFriendRows(friend, seedMap, energyStatus) {
+  async function buildFriendRows(friend, seedMap, energyStatus, options = {}) {
     try {
       const farm = await fetchFriendFarm(friend.id);
       const crops = normalizeCrops(farm.crops ?? []);
@@ -299,8 +302,11 @@
         ),
       );
     } catch (error) {
-      console.warn("[farm-friend-monitor] friend", friend.id, error);
-      return [];
+      if (options.swallowErrors !== false) {
+        console.warn("[farm-friend-monitor] friend", friend.id, error);
+        return [];
+      }
+      throw error;
     }
   }
 
@@ -788,6 +794,9 @@
     if (!autoStealState.enabled && autoStealState.inFlight) {
       return AUTO_STEAL_STATUS_TEXT.stopping;
     }
+    if (autoStealState.challengeRequired) {
+      return AUTO_STEAL_STATUS_TEXT.challenge;
+    }
     if (autoStealState.inFlight) {
       return AUTO_STEAL_STATUS_TEXT.inFlight;
     }
@@ -803,13 +812,9 @@
 
   function startAutoSteal() {
     autoStealState.enabled = true;
-    autoStealState.cursor = 0;
+    autoStealState.challengeRequired = false;
     saveStateSnapshot();
-    if (state.isLoading) {
-      render();
-      return;
-    }
-    void loadData();
+    render();
   }
 
   function stopAutoSteal(shouldRender = true) {
@@ -890,12 +895,22 @@
     clearFriendStealVerdicts(target.friendId);
     pushAutoStealResult(target, AUTO_STEAL_RESULT_KIND.success, "自动偷取请求成功，正在刷新面板");
     await delay(AUTO_STEAL_CONFIG.successRefreshDelayMs);
-    await loadData();
+    await refreshSingleFriend(target);
   }
 
   function handleAutoStealFailure(target, error) {
     const errorCode = getErrorCode(error);
     const errorMessage = toErrorMessage(error);
+    if (isVerificationRequiredError(error)) {
+      autoStealState.challengeRequired = true;
+      stopAutoSteal(false);
+      pushAutoStealResult(
+        target,
+        AUTO_STEAL_RESULT_KIND.challenge,
+        "检测到验证页，请先在浏览器里手动通过验证，再重新开启自动偷取",
+      );
+      return;
+    }
     if (errorCode === AUTO_STEAL_CONFIG.emptyErrorCode) {
       setFriendStealVerdict(target.friendId, target.primaryRow?.farmSignature ?? "", FRIEND_STEAL_VERDICT_KIND.empty);
       pushAutoStealResult(target, AUTO_STEAL_RESULT_KIND.empty, errorMessage);
@@ -918,6 +933,43 @@
       AUTO_STEAL_CONFIG.recentResultLimit,
     );
     saveStateSnapshot();
+  }
+
+  async function refreshSingleFriend(target) {
+    try {
+      const [seedMap, energyStatus] = await Promise.all([fetchSeedMap(), fetchEnergyStatus()]);
+      const friendRows = await buildFriendRows(
+        {
+          id: target.friendId,
+          username: target.friendName,
+          avatar: null,
+        },
+        seedMap,
+        energyStatus,
+        { swallowErrors: false },
+      );
+      replaceFriendRows(target.friendId, friendRows, energyStatus);
+      state.updatedAt = formatTime(new Date());
+      state.error = "";
+      autoStealState.challengeRequired = false;
+      saveStateSnapshot();
+      render();
+    } catch (error) {
+      console.warn("[farm-friend-monitor] refresh-single-friend", target.friendId, error);
+      pushAutoStealResult(target, AUTO_STEAL_RESULT_KIND.error, toErrorMessage(error));
+    }
+  }
+
+  function replaceFriendRows(friendId, nextRows, energyStatus) {
+    const retainedRows = state.rows.filter((row) => row.friendId !== friendId);
+    const mergedRows = [...retainedRows, ...applyFriendStealVerdictsToRows(nextRows)].sort(compareRows);
+    const friendCount = state.summary?.friendCount ?? countUniqueFriendIds(mergedRows);
+    state.rows = mergedRows;
+    state.summary = buildSummary(mergedRows, friendCount, energyStatus);
+  }
+
+  function countUniqueFriendIds(rows) {
+    return new Set(rows.map((row) => row.friendId)).size;
   }
 
   function render(nextRenderState = null) {
@@ -1244,12 +1296,42 @@
       .friend-monitor-body {
         flex: 1 1 auto;
         min-height: 0;
-        overflow: auto;
+        overflow-y: auto;
+        overflow-x: hidden;
         padding: 16px;
+        -webkit-overflow-scrolling: touch;
+      }
+
+      .friend-monitor-stack {
         display: flex;
         flex-direction: column;
         gap: 16px;
-        -webkit-overflow-scrolling: touch;
+        min-height: 100%;
+        min-width: 0;
+      }
+
+      .friend-monitor-stack > * {
+        min-height: 0;
+      }
+
+      .friend-monitor-filters,
+      .friend-monitor-summary,
+      .friend-monitor-auto-panel,
+      .friend-monitor-state,
+      .friend-monitor-error,
+      .friend-monitor-empty,
+      .friend-monitor-footnote {
+        flex: 0 0 auto;
+      }
+
+      .friend-monitor-table-wrap,
+      .friend-monitor-mobile-list {
+        flex: 0 0 auto;
+        width: 100%;
+      }
+
+      .friend-monitor-empty {
+        width: 100%;
       }
 
       .friend-monitor-filters,
@@ -1349,6 +1431,7 @@
         display: flex;
         flex-direction: column;
         gap: 12px;
+        min-height: 0;
       }
 
       .friend-monitor-auto-head {
@@ -1400,6 +1483,11 @@
         background: rgba(241, 251, 240, 0.96);
       }
 
+      .friend-monitor-auto-result.challenge {
+        border-color: rgba(74, 120, 194, 0.18);
+        background: rgba(240, 246, 255, 0.96);
+      }
+
       .friend-monitor-auto-result.empty {
         border-color: rgba(201, 144, 51, 0.18);
         background: rgba(255, 249, 237, 0.96);
@@ -1412,6 +1500,8 @@
 
       .friend-monitor-table-wrap {
         overflow: auto;
+        max-height: min(48vh, 560px);
+        min-height: 0;
         border-radius: 18px;
         border: 1px solid rgba(111, 146, 89, 0.14);
         background: rgba(255, 255, 255, 0.86);
@@ -1549,6 +1639,11 @@
         display: flex;
         flex-direction: column;
         gap: 12px;
+        max-height: min(48vh, 560px);
+        min-height: 0;
+        overflow-y: auto;
+        padding-right: 4px;
+        -webkit-overflow-scrolling: touch;
       }
 
       .friend-monitor-mobile-card {
@@ -1660,7 +1755,15 @@
 
         .friend-monitor-body {
           padding: 14px;
+        }
+
+        .friend-monitor-stack {
           gap: 14px;
+        }
+
+        .friend-monitor-table-wrap,
+        .friend-monitor-mobile-list {
+          max-height: min(44vh, 460px);
         }
 
         .friend-monitor-filters {
@@ -1736,7 +1839,9 @@
             </button>
           </div>
         </div>
-        <div class="friend-monitor-body">${mainBlock}</div>
+        <div class="friend-monitor-body">
+          <div class="friend-monitor-stack">${mainBlock}</div>
+        </div>
       </div>
     `;
   }
@@ -2218,6 +2323,8 @@
 
     restoreFriendStealVerdicts(snapshot.friendStealVerdicts);
     autoStealState.recentResults = snapshot.autoStealRecentResults;
+    autoStealState.cursor = snapshot.autoStealCursor;
+    autoStealState.challengeRequired = snapshot.autoStealChallengeRequired;
     state.rows = applyFriendStealVerdictsToRows(snapshot.rows);
     state.summary = snapshot.summary;
     state.updatedAt = snapshot.updatedAt;
@@ -2247,6 +2354,8 @@
           updatedAt: state.updatedAt,
           error: state.error,
           autoStealRecentResults: autoStealState.recentResults,
+          autoStealCursor: autoStealState.cursor,
+          autoStealChallengeRequired: autoStealState.challengeRequired,
           friendStealVerdicts: [...friendStealVerdictMap.values()],
         }),
       );
@@ -2262,8 +2371,15 @@
       updatedAt: typeof snapshot?.updatedAt === "string" ? snapshot.updatedAt : "",
       error: typeof snapshot?.error === "string" ? snapshot.error : "",
       autoStealRecentResults: normalizeAutoStealRecentResults(snapshot?.autoStealRecentResults),
+      autoStealCursor: normalizeAutoStealCursor(snapshot?.autoStealCursor),
+      autoStealChallengeRequired: Boolean(snapshot?.autoStealChallengeRequired),
       friendStealVerdicts: normalizeFriendStealVerdictList(snapshot?.friendStealVerdicts),
     };
+  }
+
+  function normalizeAutoStealCursor(cursorValue) {
+    const cursor = toFiniteNumber(cursorValue, 0);
+    return cursor >= 0 ? Math.trunc(cursor) : 0;
   }
 
   function normalizeAutoStealRecentResults(results) {
@@ -2584,21 +2700,34 @@
     }
 
     const response = await fetch(requestUrl, requestOptions);
-    const payload = await response.json().catch(() => null);
+    const responseText = await response.text();
+    const payload = parseJsonPayload(responseText);
     if (!response.ok) {
-      throw buildRequestError(response, payload);
+      throw buildRequestError(response, payload, responseText);
     }
     if (payload && payload.success === false) {
-      throw buildRequestError(response, payload);
+      throw buildRequestError(response, payload, responseText);
     }
     return payload;
   }
 
-  function buildRequestError(response, payload) {
+  function parseJsonPayload(responseText) {
+    if (!responseText) {
+      return null;
+    }
+    try {
+      return JSON.parse(responseText);
+    } catch (error) {
+      return null;
+    }
+  }
+
+  function buildRequestError(response, payload, responseText = "") {
     const error = new Error(payload?.error?.message || payload?.message || `${response.status} ${response.statusText}`);
     error.code = payload?.error?.code ?? payload?.code ?? response.status;
     error.payload = payload;
     error.status = response.status;
+    error.challengeRequired = isVerificationChallengeResponse(response, payload, responseText);
     return error;
   }
 
@@ -2607,6 +2736,28 @@
       return null;
     }
     return toNullableNumber(error.code);
+  }
+
+  function isVerificationRequiredError(error) {
+    return Boolean(error?.challengeRequired);
+  }
+
+  function isVerificationChallengeResponse(response, payload, responseText) {
+    const bodyText = String(responseText ?? "").toLowerCase();
+    if (response.status === 403 || response.status === 429 || response.status === 503) {
+      if (
+        bodyText.includes("cloudflare") ||
+        bodyText.includes("just a moment") ||
+        bodyText.includes("attention required") ||
+        bodyText.includes("cf-browser-verification")
+      ) {
+        return true;
+      }
+    }
+    if (payload) {
+      return false;
+    }
+    return bodyText.includes("cloudflare") || bodyText.includes("just a moment") || bodyText.includes("attention required");
   }
 
   function buildRequestUrl(path) {
