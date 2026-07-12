@@ -84,6 +84,7 @@
     recentResultLimit: 8,
     successRefreshDelayMs: 1200,
     emptyErrorCode: 20053,
+    dailyLimitMessageText: "今日已偷取",
   });
 
   const AUTO_STEAL_RESULT_KIND = Object.freeze({
@@ -102,12 +103,16 @@
     inFlight: "自动偷取执行中",
   });
 
-  const FRIEND_STEAL_VERDICT_KIND = Object.freeze({
+  const AUTO_STEAL_FRIEND_STATE_KIND = Object.freeze({
     empty: "empty",
+    dailyLimit: "daily_limit",
+    recentSuccess: "recent_success",
   });
 
-  const FRIEND_STEAL_VERDICT_TEXT = Object.freeze({
+  const AUTO_STEAL_FRIEND_STATE_TEXT = Object.freeze({
     empty: "服务端判定已偷空",
+    dailyLimit: "今日已偷取，不可贪多哦",
+    recentSuccess: "本轮已处理，等待农场变化",
   });
 
   const state = {
@@ -127,7 +132,7 @@
     challengeRequired: false,
   };
 
-  const friendStealVerdictMap = new Map();
+  const autoStealFriendStateMap = new Map();
 
   const tabSessionId = ensureTabSessionId();
   const uiState = loadUiState();
@@ -137,6 +142,7 @@
   let resizeObserver = null;
   let dragState = null;
   let expandedFriendId = "";
+  let hasAutoLoadedOnFirstOpen = false;
 
   function bootstrap() {
     if (booted) {
@@ -159,9 +165,11 @@
   }
 
   function maybeLoadDataForOpenWindow() {
-    if (!uiState.open || state.isLoading) {
+    if (!uiState.open || state.isLoading || hasAutoLoadedOnFirstOpen) {
       return;
     }
+    hasAutoLoadedOnFirstOpen = true;
+    void loadData();
   }
 
   async function loadData() {
@@ -180,7 +188,7 @@
       if (currentToken !== loadToken) {
         return;
       }
-      state.rows = applyFriendStealVerdictsToRows(snapshot.rows);
+      state.rows = syncAutoStealFriendStatesForRows(snapshot.rows, snapshot.updatedAt.getTime()).sort(compareRows);
       state.summary = snapshot.summary;
       state.updatedAt = formatTime(snapshot.updatedAt);
       state.error = "";
@@ -276,7 +284,7 @@
     }
   }
 
-  async function buildFriendRows(friend, seedMap, energyStatus, options = {}) {
+  async function buildFriendRows(friend, seedMap, energyStatus) {
     try {
       const farm = await fetchFriendFarm(friend.id);
       const crops = normalizeCrops(farm.crops ?? []);
@@ -302,11 +310,8 @@
         ),
       );
     } catch (error) {
-      if (options.swallowErrors !== false) {
-        console.warn("[farm-friend-monitor] friend", friend.id, error);
-        return [];
-      }
-      throw error;
+      console.warn("[farm-friend-monitor] friend", friend.id, error);
+      return [];
     }
   }
 
@@ -559,8 +564,11 @@
       maturesAtMs: group.maturesAtMs,
       remainingTime: group.remainingTime,
       isMature: group.isMature,
+      baseCanAttempt: canAttempt,
       canAttempt,
+      baseStatusKey: status.key,
       statusKey: status.key,
+      baseStatusText: status.text,
       statusText: status.text,
       currentRoundStolenQuantity: seedStat?.stolenQuantity ?? 0,
       currentRoundStolenPlots,
@@ -572,75 +580,114 @@
     };
   }
 
-  function applyFriendStealVerdictsToRows(rows) {
+  function applyAutoStealFriendStatesToRows(rows, referenceTimeMs = Date.now()) {
+    pruneExpiredAutoStealFriendStates(referenceTimeMs);
     return rows.map((row) => {
-      const verdict = getFriendStealVerdict(row.friendId, row.farmSignature);
-      if (!verdict || !row.isMature) {
-        return row;
+      const normalizedRow = normalizeRowBaseState(row);
+      const friendState = getAutoStealFriendState(normalizedRow.friendId, normalizedRow.farmSignature);
+      if (!friendState || !normalizedRow.isMature) {
+        return normalizedRow;
       }
       return {
-        ...row,
+        ...normalizedRow,
         canAttempt: false,
         statusKey: "done",
-        statusText: verdict.text,
+        statusText: friendState.text,
       };
     });
   }
 
-  function getFriendStealVerdict(friendId, farmSignature) {
-    if (!friendId || !farmSignature) {
-      return null;
-    }
-    return friendStealVerdictMap.get(buildFriendStealVerdictKey(friendId, farmSignature)) ?? null;
-  }
-
-  function setFriendStealVerdict(friendId, farmSignature, verdictKind) {
-    if (!friendId || !farmSignature) {
-      return;
-    }
-    friendStealVerdictMap.set(
-      buildFriendStealVerdictKey(friendId, farmSignature),
-      buildFriendStealVerdict(friendId, farmSignature, verdictKind),
-    );
-    state.rows = applyFriendStealVerdictsToRows(state.rows);
-    saveStateSnapshot();
-  }
-
-  function buildFriendStealVerdict(friendId, farmSignature, verdictKind) {
+  function normalizeRowBaseState(row) {
+    const baseCanAttempt = typeof row?.baseCanAttempt === "boolean" ? row.baseCanAttempt : Boolean(row?.canAttempt);
+    const baseStatusKey = typeof row?.baseStatusKey === "string" ? row.baseStatusKey : String(row?.statusKey ?? "done");
+    const baseStatusText = typeof row?.baseStatusText === "string" ? row.baseStatusText : String(row?.statusText ?? "");
     return {
-      friendId,
-      farmSignature,
-      kind: verdictKind,
-      text: resolveFriendStealVerdictText(verdictKind),
-      updatedAtMs: Date.now(),
+      ...row,
+      baseCanAttempt,
+      canAttempt: baseCanAttempt,
+      baseStatusKey,
+      statusKey: baseStatusKey,
+      baseStatusText,
+      statusText: baseStatusText,
     };
   }
 
-  function resolveFriendStealVerdictText(verdictKind) {
-    if (verdictKind === FRIEND_STEAL_VERDICT_KIND.empty) {
-      return FRIEND_STEAL_VERDICT_TEXT.empty;
+  function getAutoStealFriendState(friendId, farmSignature = "") {
+    if (!friendId) {
+      return null;
     }
-    return FRIEND_STEAL_VERDICT_TEXT.empty;
+    const exactState = getActiveAutoStealFriendStateByKey(buildAutoStealFriendStateKey(friendId, farmSignature));
+    if (exactState) {
+      return exactState;
+    }
+    return getActiveAutoStealFriendStateByKey(buildAutoStealFriendStateKey(friendId, ""));
   }
 
-  function clearFriendStealVerdicts(friendId) {
+  function getActiveAutoStealFriendStateByKey(stateKey) {
+    if (!stateKey) {
+      return null;
+    }
+    const friendState = autoStealFriendStateMap.get(stateKey) ?? null;
+    if (!friendState) {
+      return null;
+    }
+    if (friendState.expiresAtMs === null || friendState.expiresAtMs > Date.now()) {
+      return friendState;
+    }
+    autoStealFriendStateMap.delete(stateKey);
+    return null;
+  }
+
+  function setAutoStealFriendState(friendId, farmSignature, kind, options = {}) {
     if (!friendId) {
       return;
     }
-    let changed = false;
-    for (const [key, verdict] of friendStealVerdictMap.entries()) {
-      if (verdict.friendId !== friendId) {
+    clearAutoStealFriendStates(friendId);
+    const nextState = buildAutoStealFriendState(friendId, farmSignature, kind, options.referenceTimeMs);
+    autoStealFriendStateMap.set(buildAutoStealFriendStateKey(friendId, nextState.farmSignature), nextState);
+    state.rows = applyAutoStealFriendStatesToRows(state.rows, options.referenceTimeMs);
+    saveStateSnapshot();
+  }
+
+  function buildAutoStealFriendState(friendId, farmSignature, kind, referenceTimeMs = Date.now()) {
+    return {
+      friendId,
+      farmSignature: shouldAutoStealFriendStateBindFarmSignature(kind) ? String(farmSignature ?? "") : "",
+      kind,
+      text: resolveAutoStealFriendStateText(kind),
+      expiresAtMs: resolveAutoStealFriendStateExpiresAtMs(kind, referenceTimeMs),
+      updatedAtMs: referenceTimeMs,
+    };
+  }
+
+  function shouldAutoStealFriendStateBindFarmSignature(kind) {
+    return kind === AUTO_STEAL_FRIEND_STATE_KIND.empty || kind === AUTO_STEAL_FRIEND_STATE_KIND.recentSuccess;
+  }
+
+  function resolveAutoStealFriendStateText(kind) {
+    return AUTO_STEAL_FRIEND_STATE_TEXT[kind] ?? AUTO_STEAL_FRIEND_STATE_TEXT.empty;
+  }
+
+  function resolveAutoStealFriendStateExpiresAtMs(kind, nowMs = Date.now()) {
+    if (kind === AUTO_STEAL_FRIEND_STATE_KIND.dailyLimit) {
+      return getNextLocalDayStartMs(nowMs);
+    }
+    return null;
+  }
+
+  function clearAutoStealFriendStates(friendId) {
+    if (!friendId) {
+      return;
+    }
+    for (const [stateKey, friendState] of autoStealFriendStateMap.entries()) {
+      if (friendState.friendId !== friendId) {
         continue;
       }
-      friendStealVerdictMap.delete(key);
-      changed = true;
-    }
-    if (changed) {
-      saveStateSnapshot();
+      autoStealFriendStateMap.delete(stateKey);
     }
   }
 
-  function buildFriendStealVerdictKey(friendId, farmSignature) {
+  function buildAutoStealFriendStateKey(friendId, farmSignature = "") {
     return `${friendId}::${farmSignature}`;
   }
 
@@ -783,6 +830,7 @@
   }
 
   function getAutoStealCandidates() {
+    syncAutoStealFriendStatesInCurrentRows();
     return buildFriendGroups(state.rows).filter((group) => group.primaryRow?.canAttempt);
   }
 
@@ -863,13 +911,13 @@
     render();
 
     try {
-      const response = await requestJson("/api/farm/steal/friend-auto", {
+      await requestJson("/api/farm/steal/friend-auto", {
         method: "POST",
         body: {
           friendId: target.friendId,
         },
       });
-      await handleAutoStealSuccess(target, response);
+      await handleAutoStealSuccess(target);
     } catch (error) {
       handleAutoStealFailure(target, error);
     } finally {
@@ -892,10 +940,14 @@
   }
 
   async function handleAutoStealSuccess(target) {
-    clearFriendStealVerdicts(target.friendId);
-    pushAutoStealResult(target, AUTO_STEAL_RESULT_KIND.success, "自动偷取请求成功，正在刷新面板");
+    setAutoStealFriendState(
+      target.friendId,
+      target.primaryRow?.farmSignature ?? "",
+      AUTO_STEAL_FRIEND_STATE_KIND.recentSuccess,
+    );
+    pushAutoStealResult(target, AUTO_STEAL_RESULT_KIND.success, "自动偷取请求成功，正在全量刷新确认结果");
     await delay(AUTO_STEAL_CONFIG.successRefreshDelayMs);
-    await refreshSingleFriend(target);
+    await loadData();
   }
 
   function handleAutoStealFailure(target, error) {
@@ -911,8 +963,17 @@
       );
       return;
     }
+    if (isDailyLimitAutoStealError(errorMessage)) {
+      setAutoStealFriendState(target.friendId, "", AUTO_STEAL_FRIEND_STATE_KIND.dailyLimit);
+      pushAutoStealResult(target, AUTO_STEAL_RESULT_KIND.error, errorMessage);
+      return;
+    }
     if (errorCode === AUTO_STEAL_CONFIG.emptyErrorCode) {
-      setFriendStealVerdict(target.friendId, target.primaryRow?.farmSignature ?? "", FRIEND_STEAL_VERDICT_KIND.empty);
+      setAutoStealFriendState(
+        target.friendId,
+        target.primaryRow?.farmSignature ?? "",
+        AUTO_STEAL_FRIEND_STATE_KIND.empty,
+      );
       pushAutoStealResult(target, AUTO_STEAL_RESULT_KIND.empty, errorMessage);
       return;
     }
@@ -935,45 +996,62 @@
     saveStateSnapshot();
   }
 
-  async function refreshSingleFriend(target) {
-    try {
-      const [seedMap, energyStatus] = await Promise.all([fetchSeedMap(), fetchEnergyStatus()]);
-      const friendRows = await buildFriendRows(
-        {
-          id: target.friendId,
-          username: target.friendName,
-          avatar: null,
-        },
-        seedMap,
-        energyStatus,
-        { swallowErrors: false },
-      );
-      replaceFriendRows(target.friendId, friendRows, energyStatus);
-      state.updatedAt = formatTime(new Date());
-      state.error = "";
-      autoStealState.challengeRequired = false;
-      saveStateSnapshot();
-      render();
-    } catch (error) {
-      console.warn("[farm-friend-monitor] refresh-single-friend", target.friendId, error);
-      pushAutoStealResult(target, AUTO_STEAL_RESULT_KIND.error, toErrorMessage(error));
+  function getNextLocalDayStartMs(nowMs = Date.now()) {
+    const nextDay = new Date(nowMs);
+    nextDay.setHours(24, 0, 0, 0);
+    return nextDay.getTime();
+  }
+
+  function pruneExpiredAutoStealFriendStates(referenceTimeMs = Date.now()) {
+    for (const [stateKey, friendState] of autoStealFriendStateMap.entries()) {
+      if (friendState.expiresAtMs === null || friendState.expiresAtMs > referenceTimeMs) {
+        continue;
+      }
+      autoStealFriendStateMap.delete(stateKey);
     }
   }
 
-  function replaceFriendRows(friendId, nextRows, energyStatus) {
-    const retainedRows = state.rows.filter((row) => row.friendId !== friendId);
-    const mergedRows = [...retainedRows, ...applyFriendStealVerdictsToRows(nextRows)].sort(compareRows);
-    const friendCount = state.summary?.friendCount ?? countUniqueFriendIds(mergedRows);
-    state.rows = mergedRows;
-    state.summary = buildSummary(mergedRows, friendCount, energyStatus);
+  function pruneStaleAutoStealFriendStates(rows) {
+    const activeFarmStateKeys = new Set(rows.map((row) => buildAutoStealFriendStateKey(row.friendId, row.farmSignature)));
+    for (const [stateKey, friendState] of autoStealFriendStateMap.entries()) {
+      if (!shouldAutoStealFriendStateBindFarmSignature(friendState.kind)) {
+        continue;
+      }
+      if (activeFarmStateKeys.has(stateKey)) {
+        continue;
+      }
+      autoStealFriendStateMap.delete(stateKey);
+    }
   }
 
-  function countUniqueFriendIds(rows) {
-    return new Set(rows.map((row) => row.friendId)).size;
+  function syncAutoStealFriendStatesForRows(rows, referenceTimeMs = Date.now()) {
+    pruneExpiredAutoStealFriendStates(referenceTimeMs);
+    pruneStaleAutoStealFriendStates(rows);
+    return applyAutoStealFriendStatesToRows(rows, referenceTimeMs);
+  }
+
+  function syncAutoStealFriendStatesInCurrentRows(referenceTimeMs = Date.now()) {
+    pruneExpiredAutoStealFriendStates(referenceTimeMs);
+    state.rows = applyAutoStealFriendStatesToRows(state.rows, referenceTimeMs).sort(compareRows);
+  }
+
+  function normalizeLegacyAutoStealFriendStateKind(kind) {
+    if (kind === "daily_limit") {
+      return AUTO_STEAL_FRIEND_STATE_KIND.dailyLimit;
+    }
+    if (kind === "success_cooldown") {
+      return AUTO_STEAL_FRIEND_STATE_KIND.recentSuccess;
+    }
+    return "";
+  }
+
+  function isDailyLimitAutoStealError(errorMessage) {
+    return String(errorMessage ?? "").includes(AUTO_STEAL_CONFIG.dailyLimitMessageText);
   }
 
   function render(nextRenderState = null) {
     const panel = ensurePanel();
+    syncAutoStealFriendStatesInCurrentRows();
     const renderState = nextRenderState ?? captureRenderState(panel);
     panel.innerHTML = buildPanelHtml();
 
@@ -1921,7 +1999,7 @@
   function buildAutoStealResultHtml(result) {
     return `
       <div class="friend-monitor-auto-result ${escapeHtml(result.kind)}">
-        <strong>${escapeHtml(`${result.timeText} · ${result.friendName}`)}</strong>
+        <strong>${escapeHtml(`${result.timeText} · 目标 ${result.friendName}`)}</strong>
         <span>${escapeHtml(result.text)}</span>
       </div>
     `;
@@ -2172,7 +2250,7 @@
   function buildFootnoteHtml() {
     return `
       <div class="friend-monitor-footnote">
-        自动偷取会调用 <code>/api/farm/steal/friend-auto</code>，面板会把服务端返回的偷空结论回写到当前标签页状态。点击前的可偷判断仍旧来自成熟状态、偷取日志和理论余量估算。
+        自动偷取会调用 <code>/api/farm/steal/friend-auto</code>，面板会把服务端返回的偷取结果回写到当前标签页状态。点击前的基础判断仍旧来自成熟状态、偷取日志和理论余量估算。
       </div>
     `;
   }
@@ -2321,11 +2399,11 @@
       return;
     }
 
-    restoreFriendStealVerdicts(snapshot.friendStealVerdicts);
+    restoreAutoStealFriendStates(snapshot.autoStealFriendStates);
     autoStealState.recentResults = snapshot.autoStealRecentResults;
     autoStealState.cursor = snapshot.autoStealCursor;
     autoStealState.challengeRequired = snapshot.autoStealChallengeRequired;
-    state.rows = applyFriendStealVerdictsToRows(snapshot.rows);
+    state.rows = syncAutoStealFriendStatesForRows(snapshot.rows).sort(compareRows);
     state.summary = snapshot.summary;
     state.updatedAt = snapshot.updatedAt;
     state.error = snapshot.error;
@@ -2346,6 +2424,7 @@
 
   function saveStateSnapshot() {
     try {
+      pruneExpiredAutoStealFriendStates();
       sessionStorage.setItem(
         buildSessionStorageKey(APP_CONFIG.snapshotStateKey),
         JSON.stringify({
@@ -2356,7 +2435,7 @@
           autoStealRecentResults: autoStealState.recentResults,
           autoStealCursor: autoStealState.cursor,
           autoStealChallengeRequired: autoStealState.challengeRequired,
-          friendStealVerdicts: [...friendStealVerdictMap.values()],
+          autoStealFriendStates: [...autoStealFriendStateMap.values()],
         }),
       );
     } catch (error) {
@@ -2373,7 +2452,11 @@
       autoStealRecentResults: normalizeAutoStealRecentResults(snapshot?.autoStealRecentResults),
       autoStealCursor: normalizeAutoStealCursor(snapshot?.autoStealCursor),
       autoStealChallengeRequired: Boolean(snapshot?.autoStealChallengeRequired),
-      friendStealVerdicts: normalizeFriendStealVerdictList(snapshot?.friendStealVerdicts),
+      autoStealFriendStates: normalizeAutoStealFriendStateList(
+        snapshot?.autoStealFriendStates,
+        snapshot?.autoStealFriendBlocks,
+        snapshot?.friendStealVerdicts,
+      ),
     };
   }
 
@@ -2413,37 +2496,121 @@
     return Object.values(AUTO_STEAL_RESULT_KIND).includes(kind) ? kind : "";
   }
 
-  function normalizeFriendStealVerdictList(verdicts) {
+  function normalizeAutoStealFriendStateList(states, legacyBlocks, legacyVerdicts) {
+    const nextStateMap = new Map();
+
+    for (const friendState of normalizeCurrentAutoStealFriendStates(states)) {
+      nextStateMap.set(buildAutoStealFriendStateKey(friendState.friendId, friendState.farmSignature), friendState);
+    }
+    for (const friendState of normalizeLegacyAutoStealFriendBlocks(legacyBlocks)) {
+      nextStateMap.set(buildAutoStealFriendStateKey(friendState.friendId, friendState.farmSignature), friendState);
+    }
+    for (const friendState of normalizeLegacyFriendStealVerdicts(legacyVerdicts)) {
+      nextStateMap.set(buildAutoStealFriendStateKey(friendState.friendId, friendState.farmSignature), friendState);
+    }
+
+    return [...nextStateMap.values()];
+  }
+
+  function normalizeCurrentAutoStealFriendStates(states) {
+    if (!Array.isArray(states)) {
+      return [];
+    }
+    return states
+      .map((friendState) => normalizeAutoStealFriendState(friendState, friendState?.kind))
+      .filter(Boolean);
+  }
+
+  function normalizeLegacyAutoStealFriendBlocks(blocks) {
+    if (!Array.isArray(blocks)) {
+      return [];
+    }
+    return blocks
+      .map((block) => normalizeLegacyAutoStealFriendBlock(block))
+      .filter(Boolean);
+  }
+
+  function normalizeLegacyFriendStealVerdicts(verdicts) {
     if (!Array.isArray(verdicts)) {
       return [];
     }
     return verdicts
-      .map((verdict) => {
-        const friendId = typeof verdict?.friendId === "string" ? verdict.friendId : "";
-        const farmSignature = typeof verdict?.farmSignature === "string" ? verdict.farmSignature : "";
-        const kind = normalizeFriendStealVerdictKind(verdict?.kind);
-        if (!friendId || !farmSignature || !kind) {
-          return null;
-        }
-        return {
-          friendId,
-          farmSignature,
-          kind,
-          text: typeof verdict?.text === "string" ? verdict.text : resolveFriendStealVerdictText(kind),
-          updatedAtMs: toFiniteNumber(verdict?.updatedAtMs, Date.now()),
-        };
-      })
+      .map((verdict) => normalizeAutoStealFriendState(verdict, verdict?.kind))
       .filter(Boolean);
   }
 
-  function normalizeFriendStealVerdictKind(kind) {
-    return Object.values(FRIEND_STEAL_VERDICT_KIND).includes(kind) ? kind : "";
+  function normalizeAutoStealFriendState(friendState, rawKind) {
+    const friendId = typeof friendState?.friendId === "string" ? friendState.friendId : "";
+    const kind = normalizeAutoStealFriendStateKind(rawKind);
+    if (!friendId || !kind) {
+      return null;
+    }
+    const farmSignature = shouldAutoStealFriendStateBindFarmSignature(kind)
+      ? String(friendState?.farmSignature ?? "")
+      : "";
+    if (shouldAutoStealFriendStateBindFarmSignature(kind) && !farmSignature) {
+      return null;
+    }
+    const expiresAtMs = normalizeAutoStealFriendStateExpiresAtMs(friendState?.expiresAtMs, kind);
+    if (kind === AUTO_STEAL_FRIEND_STATE_KIND.dailyLimit && expiresAtMs === null) {
+      return null;
+    }
+    return {
+      friendId,
+      farmSignature,
+      kind,
+      text: typeof friendState?.text === "string" ? friendState.text : resolveAutoStealFriendStateText(kind),
+      expiresAtMs,
+      updatedAtMs: toFiniteNumber(friendState?.updatedAtMs, Date.now()),
+    };
   }
 
-  function restoreFriendStealVerdicts(verdicts) {
-    friendStealVerdictMap.clear();
-    for (const verdict of verdicts) {
-      friendStealVerdictMap.set(buildFriendStealVerdictKey(verdict.friendId, verdict.farmSignature), verdict);
+  function normalizeAutoStealFriendStateKind(kind) {
+    return Object.values(AUTO_STEAL_FRIEND_STATE_KIND).includes(kind) ? kind : "";
+  }
+
+  function normalizeLegacyAutoStealFriendBlock(block) {
+    const kind = normalizeLegacyAutoStealFriendStateKind(block?.kind);
+    const friendId = typeof block?.friendId === "string" ? block.friendId : "";
+    if (!friendId || !kind) {
+      return null;
+    }
+    const expiresAtMs = normalizeAutoStealFriendStateExpiresAtMs(block?.expiresAtMs, AUTO_STEAL_FRIEND_STATE_KIND.dailyLimit);
+    if (kind === AUTO_STEAL_FRIEND_STATE_KIND.dailyLimit && expiresAtMs === null) {
+      return null;
+    }
+    const legacyExpiresAtMs =
+      kind === AUTO_STEAL_FRIEND_STATE_KIND.recentSuccess
+        ? toFiniteNumber(block?.expiresAtMs, 0)
+        : expiresAtMs;
+    if (kind === AUTO_STEAL_FRIEND_STATE_KIND.recentSuccess && legacyExpiresAtMs <= Date.now()) {
+      return null;
+    }
+    return {
+      friendId,
+      farmSignature: "",
+      kind,
+      text: typeof block?.text === "string" ? block.text : resolveAutoStealFriendStateText(kind),
+      expiresAtMs: kind === AUTO_STEAL_FRIEND_STATE_KIND.recentSuccess ? legacyExpiresAtMs : expiresAtMs,
+      updatedAtMs: toFiniteNumber(block?.updatedAtMs, Date.now()),
+    };
+  }
+
+  function normalizeAutoStealFriendStateExpiresAtMs(expiresAtMsValue, kind) {
+    if (kind === AUTO_STEAL_FRIEND_STATE_KIND.dailyLimit) {
+      const expiresAtMs = toFiniteNumber(expiresAtMsValue, 0);
+      return expiresAtMs > Date.now() ? expiresAtMs : null;
+    }
+    return null;
+  }
+
+  function restoreAutoStealFriendStates(friendStates) {
+    autoStealFriendStateMap.clear();
+    for (const friendState of friendStates) {
+      autoStealFriendStateMap.set(
+        buildAutoStealFriendStateKey(friendState.friendId, friendState.farmSignature),
+        friendState,
+      );
     }
   }
 
