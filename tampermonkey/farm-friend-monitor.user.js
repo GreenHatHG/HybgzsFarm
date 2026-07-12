@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         农场好友总览助手
 // @namespace    hybgzs-farm-helper
-// @version      0.1.5
+// @version      0.1.6
 // @description  汇总所有好友当前种植情况，显示成熟时间和偷菜前置判断
 // @match        https://cdk.hybgzs.com/entertainment/farm*
 // @match        https://cdk.hybgzs.com/entertainment/farm/*
@@ -34,6 +34,7 @@
     styleId: "farm-friend-monitor-style",
     launcherId: "farm-friend-monitor-launcher",
     refreshButtonId: "farm-friend-monitor-refresh",
+    autoStealToggleButtonId: "farm-friend-monitor-auto-steal-toggle",
     mobileSizeButtonId: "farm-friend-monitor-mobile-size",
     closeButtonId: "farm-friend-monitor-close",
     windowId: "farm-friend-monitor-window",
@@ -78,6 +79,35 @@
     done: 1,
   });
 
+  const AUTO_STEAL_CONFIG = Object.freeze({
+    intervalMs: 5000,
+    recentResultLimit: 8,
+    successRefreshDelayMs: 1200,
+    emptyErrorCode: 20053,
+  });
+
+  const AUTO_STEAL_RESULT_KIND = Object.freeze({
+    success: "success",
+    empty: "empty",
+    error: "error",
+  });
+
+  const AUTO_STEAL_STATUS_TEXT = Object.freeze({
+    disabled: "自动偷取已关闭",
+    stopping: "自动偷取停止中，等待当前请求结束",
+    running: "自动偷取运行中，每5秒尝试1个好友",
+    emptyQueue: "自动偷取运行中，当前没有可偷好友",
+    inFlight: "自动偷取执行中",
+  });
+
+  const FRIEND_STEAL_VERDICT_KIND = Object.freeze({
+    empty: "empty",
+  });
+
+  const FRIEND_STEAL_VERDICT_TEXT = Object.freeze({
+    empty: "服务端判定已偷空",
+  });
+
   const state = {
     isLoading: false,
     error: "",
@@ -85,6 +115,16 @@
     rows: [],
     summary: null,
   };
+
+  const autoStealState = {
+    enabled: false,
+    timerId: 0,
+    inFlight: false,
+    cursor: 0,
+    recentResults: [],
+  };
+
+  const friendStealVerdictMap = new Map();
 
   const tabSessionId = ensureTabSessionId();
   const uiState = loadUiState();
@@ -128,6 +168,7 @@
     }
 
     const currentToken = ++loadToken;
+    clearAutoStealTimer();
     state.isLoading = true;
     state.error = "";
     render();
@@ -137,7 +178,7 @@
       if (currentToken !== loadToken) {
         return;
       }
-      state.rows = snapshot.rows;
+      state.rows = applyFriendStealVerdictsToRows(snapshot.rows);
       state.summary = snapshot.summary;
       state.updatedAt = formatTime(snapshot.updatedAt);
       state.error = "";
@@ -241,13 +282,21 @@
         return [];
       }
 
+      const farmSignature = createFarmSignature(activeCrops);
       const logs = await fetchFriendLogs(friend.id, getEarliestPlantedAt(activeCrops));
       const groups = groupCrops(activeCrops);
       const seedStats = buildSeedStats(activeCrops, logs, seedMap);
       const anonymousStolenPlotMap = buildAnonymousStolenPlotMap(groups, logs);
 
       return groups.map((group) =>
-        buildRow(friend, group, seedStats.get(group.seedId), energyStatus, anonymousStolenPlotMap.get(group.id) ?? 0),
+        buildRow(
+          friend,
+          group,
+          seedStats.get(group.seedId),
+          energyStatus,
+          anonymousStolenPlotMap.get(group.id) ?? 0,
+          farmSignature,
+        ),
       );
     } catch (error) {
       console.warn("[farm-friend-monitor] friend", friend.id, error);
@@ -332,6 +381,14 @@
   function getEarliestPlantedAt(crops) {
     const earliestMs = crops.reduce((result, crop) => Math.min(result, crop.plantedAtMs), Number.POSITIVE_INFINITY);
     return Number.isFinite(earliestMs) ? new Date(earliestMs) : null;
+  }
+
+  function createFarmSignature(crops) {
+    return crops
+      .map((crop) => crop.id)
+      .filter(Boolean)
+      .sort()
+      .join(",");
   }
 
   function buildSeedStats(crops, logs, seedMap) {
@@ -474,7 +531,7 @@
     return log.type === "stolen" && !extractSeedName(log.title) && toNumber(log.meta?.plotCount) > 0;
   }
 
-  function buildRow(friend, group, seedStat, energyStatus, anonymousStolenPlots = 0) {
+  function buildRow(friend, group, seedStat, energyStatus, anonymousStolenPlots = 0, farmSignature = "") {
     const friendStealCost = resolveFriendStealCost(energyStatus);
     const energyReady = canStealFriend(energyStatus, friendStealCost);
     const activePlotCount = seedStat?.activePlotCount ?? group.plotCount;
@@ -492,6 +549,7 @@
       seedId: group.seedId,
       seedName: group.seedName,
       plotCount: group.plotCount,
+      farmSignature,
       maturesAtMs: group.maturesAtMs,
       remainingTime: group.remainingTime,
       isMature: group.isMature,
@@ -506,6 +564,78 @@
       theoreticalTotal: seedStat?.theoreticalTotal ?? null,
       estimatedRemaining: seedStat?.estimatedRemaining ?? null,
     };
+  }
+
+  function applyFriendStealVerdictsToRows(rows) {
+    return rows.map((row) => {
+      const verdict = getFriendStealVerdict(row.friendId, row.farmSignature);
+      if (!verdict || !row.isMature) {
+        return row;
+      }
+      return {
+        ...row,
+        canAttempt: false,
+        statusKey: "done",
+        statusText: verdict.text,
+      };
+    });
+  }
+
+  function getFriendStealVerdict(friendId, farmSignature) {
+    if (!friendId || !farmSignature) {
+      return null;
+    }
+    return friendStealVerdictMap.get(buildFriendStealVerdictKey(friendId, farmSignature)) ?? null;
+  }
+
+  function setFriendStealVerdict(friendId, farmSignature, verdictKind) {
+    if (!friendId || !farmSignature) {
+      return;
+    }
+    friendStealVerdictMap.set(
+      buildFriendStealVerdictKey(friendId, farmSignature),
+      buildFriendStealVerdict(friendId, farmSignature, verdictKind),
+    );
+    state.rows = applyFriendStealVerdictsToRows(state.rows);
+    saveStateSnapshot();
+  }
+
+  function buildFriendStealVerdict(friendId, farmSignature, verdictKind) {
+    return {
+      friendId,
+      farmSignature,
+      kind: verdictKind,
+      text: resolveFriendStealVerdictText(verdictKind),
+      updatedAtMs: Date.now(),
+    };
+  }
+
+  function resolveFriendStealVerdictText(verdictKind) {
+    if (verdictKind === FRIEND_STEAL_VERDICT_KIND.empty) {
+      return FRIEND_STEAL_VERDICT_TEXT.empty;
+    }
+    return FRIEND_STEAL_VERDICT_TEXT.empty;
+  }
+
+  function clearFriendStealVerdicts(friendId) {
+    if (!friendId) {
+      return;
+    }
+    let changed = false;
+    for (const [key, verdict] of friendStealVerdictMap.entries()) {
+      if (verdict.friendId !== friendId) {
+        continue;
+      }
+      friendStealVerdictMap.delete(key);
+      changed = true;
+    }
+    if (changed) {
+      saveStateSnapshot();
+    }
+  }
+
+  function buildFriendStealVerdictKey(friendId, farmSignature) {
+    return `${friendId}::${farmSignature}`;
   }
 
   function hasAvailablePlots(currentRoundStolenPlots, activePlotCount) {
@@ -646,6 +776,150 @@
     return row.currentRoundStolenQuantity > 0 || row.currentRoundStolenPlots > 0;
   }
 
+  function getAutoStealCandidates() {
+    return buildFriendGroups(state.rows).filter((group) => group.primaryRow?.canAttempt);
+  }
+
+  function getAutoStealCandidateCount() {
+    return getAutoStealCandidates().length;
+  }
+
+  function getAutoStealStatusText() {
+    if (!autoStealState.enabled && autoStealState.inFlight) {
+      return AUTO_STEAL_STATUS_TEXT.stopping;
+    }
+    if (autoStealState.inFlight) {
+      return AUTO_STEAL_STATUS_TEXT.inFlight;
+    }
+    if (!autoStealState.enabled) {
+      return AUTO_STEAL_STATUS_TEXT.disabled;
+    }
+    return getAutoStealCandidateCount() > 0 ? AUTO_STEAL_STATUS_TEXT.running : AUTO_STEAL_STATUS_TEXT.emptyQueue;
+  }
+
+  function getAutoStealToggleLabel() {
+    return autoStealState.enabled ? "停止自动偷取" : "开启自动偷取";
+  }
+
+  function startAutoSteal() {
+    autoStealState.enabled = true;
+    autoStealState.cursor = 0;
+    saveStateSnapshot();
+    if (state.isLoading) {
+      render();
+      return;
+    }
+    void loadData();
+  }
+
+  function stopAutoSteal(shouldRender = true) {
+    autoStealState.enabled = false;
+    clearAutoStealTimer();
+    saveStateSnapshot();
+    if (shouldRender) {
+      render();
+    }
+  }
+
+  function clearAutoStealTimer() {
+    if (!autoStealState.timerId) {
+      return;
+    }
+    window.clearTimeout(autoStealState.timerId);
+    autoStealState.timerId = 0;
+  }
+
+  function syncAutoStealLoop() {
+    if (!uiState.open || !autoStealState.enabled || autoStealState.inFlight || state.isLoading) {
+      clearAutoStealTimer();
+      return;
+    }
+    if (autoStealState.timerId) {
+      return;
+    }
+    autoStealState.timerId = window.setTimeout(() => {
+      autoStealState.timerId = 0;
+      void runAutoStealTick();
+    }, AUTO_STEAL_CONFIG.intervalMs);
+  }
+
+  async function runAutoStealTick() {
+    if (!uiState.open || !autoStealState.enabled || autoStealState.inFlight || state.isLoading) {
+      return;
+    }
+
+    const target = getNextAutoStealTarget();
+    if (!target) {
+      syncAutoStealLoop();
+      return;
+    }
+
+    autoStealState.inFlight = true;
+    render();
+
+    try {
+      const response = await requestJson("/api/farm/steal/friend-auto", {
+        method: "POST",
+        body: {
+          friendId: target.friendId,
+        },
+      });
+      await handleAutoStealSuccess(target, response);
+    } catch (error) {
+      handleAutoStealFailure(target, error);
+    } finally {
+      autoStealState.inFlight = false;
+      saveStateSnapshot();
+      render();
+    }
+  }
+
+  function getNextAutoStealTarget() {
+    const candidates = getAutoStealCandidates();
+    if (candidates.length === 0) {
+      autoStealState.cursor = 0;
+      return null;
+    }
+    const nextIndex = autoStealState.cursor % candidates.length;
+    const target = candidates[nextIndex];
+    autoStealState.cursor = (nextIndex + 1) % candidates.length;
+    return target;
+  }
+
+  async function handleAutoStealSuccess(target) {
+    clearFriendStealVerdicts(target.friendId);
+    pushAutoStealResult(target, AUTO_STEAL_RESULT_KIND.success, "自动偷取请求成功，正在刷新面板");
+    await delay(AUTO_STEAL_CONFIG.successRefreshDelayMs);
+    await loadData();
+  }
+
+  function handleAutoStealFailure(target, error) {
+    const errorCode = getErrorCode(error);
+    const errorMessage = toErrorMessage(error);
+    if (errorCode === AUTO_STEAL_CONFIG.emptyErrorCode) {
+      setFriendStealVerdict(target.friendId, target.primaryRow?.farmSignature ?? "", FRIEND_STEAL_VERDICT_KIND.empty);
+      pushAutoStealResult(target, AUTO_STEAL_RESULT_KIND.empty, errorMessage);
+      return;
+    }
+    pushAutoStealResult(target, AUTO_STEAL_RESULT_KIND.error, errorMessage);
+  }
+
+  function pushAutoStealResult(target, kind, text) {
+    const resultEntry = {
+      id: createTransientId(),
+      timeText: formatTime(new Date()),
+      friendId: target.friendId,
+      friendName: target.friendName,
+      kind,
+      text,
+    };
+    autoStealState.recentResults = [resultEntry, ...autoStealState.recentResults].slice(
+      0,
+      AUTO_STEAL_CONFIG.recentResultLimit,
+    );
+    saveStateSnapshot();
+  }
+
   function render(nextRenderState = null) {
     const panel = ensurePanel();
     const renderState = nextRenderState ?? captureRenderState(panel);
@@ -655,6 +929,9 @@
     if (launcherButton) {
       launcherButton.addEventListener("click", () => {
         const nextOpen = !uiState.open;
+        if (!nextOpen) {
+          stopAutoSteal(false);
+        }
         setUiState({ open: nextOpen }, true);
         if (nextOpen) {
           maybeLoadDataForOpenWindow();
@@ -672,6 +949,17 @@
       });
     }
 
+    const autoStealToggleButton = panel.querySelector(`#${APP_CONFIG.autoStealToggleButtonId}`);
+    if (autoStealToggleButton) {
+      autoStealToggleButton.addEventListener("click", () => {
+        if (autoStealState.enabled) {
+          stopAutoSteal();
+          return;
+        }
+        startAutoSteal();
+      });
+    }
+
     const mobileSizeButton = panel.querySelector(`#${APP_CONFIG.mobileSizeButtonId}`);
     if (mobileSizeButton) {
       mobileSizeButton.addEventListener("click", () => {
@@ -683,6 +971,7 @@
     const closeButton = panel.querySelector(`#${APP_CONFIG.closeButtonId}`);
     if (closeButton) {
       closeButton.addEventListener("click", () => {
+        stopAutoSteal(false);
         setUiState({ open: false }, true);
         render();
       });
@@ -737,6 +1026,7 @@
 
     observeWindowResize(windowElement);
     restoreRenderState(panel, renderState);
+    syncAutoStealLoop();
   }
 
   function captureRenderState(panel, anchorSource = null) {
@@ -926,6 +1216,7 @@
       .friend-monitor-actions {
         display: flex;
         align-items: center;
+        flex-wrap: wrap;
         gap: 10px;
       }
 
@@ -1048,6 +1339,75 @@
       .friend-monitor-footnote {
         background: rgba(255, 255, 255, 0.72);
         color: #62775c;
+      }
+
+      .friend-monitor-auto-panel {
+        padding: 14px 16px;
+        border-radius: 16px;
+        background: rgba(255, 255, 255, 0.82);
+        border: 1px solid rgba(104, 137, 91, 0.12);
+        display: flex;
+        flex-direction: column;
+        gap: 12px;
+      }
+
+      .friend-monitor-auto-head {
+        display: flex;
+        align-items: flex-start;
+        justify-content: space-between;
+        gap: 12px;
+      }
+
+      .friend-monitor-auto-head strong {
+        display: block;
+        font-size: 15px;
+      }
+
+      .friend-monitor-auto-head span {
+        display: block;
+        margin-top: 4px;
+        color: #5f7658;
+        font-size: 12px;
+      }
+
+      .friend-monitor-auto-results {
+        display: flex;
+        flex-direction: column;
+        gap: 10px;
+      }
+
+      .friend-monitor-auto-result {
+        padding: 10px 12px;
+        border-radius: 14px;
+        border: 1px solid rgba(104, 137, 91, 0.12);
+        background: rgba(248, 252, 244, 0.92);
+      }
+
+      .friend-monitor-auto-result strong {
+        display: block;
+        font-size: 12px;
+      }
+
+      .friend-monitor-auto-result span {
+        display: block;
+        margin-top: 4px;
+        color: #5f7658;
+        font-size: 12px;
+      }
+
+      .friend-monitor-auto-result.success {
+        border-color: rgba(65, 137, 83, 0.18);
+        background: rgba(241, 251, 240, 0.96);
+      }
+
+      .friend-monitor-auto-result.empty {
+        border-color: rgba(201, 144, 51, 0.18);
+        background: rgba(255, 249, 237, 0.96);
+      }
+
+      .friend-monitor-auto-result.error {
+        border-color: rgba(201, 79, 79, 0.18);
+        background: rgba(255, 241, 241, 0.96);
       }
 
       .friend-monitor-table-wrap {
@@ -1292,7 +1652,8 @@
         }
 
         .friend-monitor-bar,
-        .friend-monitor-actions {
+        .friend-monitor-actions,
+        .friend-monitor-auto-head {
           flex-direction: column;
           align-items: stretch;
         }
@@ -1362,7 +1723,11 @@
           </div>
           <div class="friend-monitor-actions">
             <span class="friend-monitor-time">${state.updatedAt ? `更新 ${escapeHtml(state.updatedAt)}` : "还没抓到数据"}</span>
+            <span class="friend-monitor-time">${escapeHtml(getAutoStealStatusText())}</span>
             ${mobileSizeButtonHtml}
+            <button id="${APP_CONFIG.autoStealToggleButtonId}" class="friend-monitor-button secondary" type="button">
+              ${escapeHtml(getAutoStealToggleLabel())}
+            </button>
             <button id="${APP_CONFIG.refreshButtonId}" class="friend-monitor-button" type="button" ${state.isLoading ? "disabled" : ""}>
               ${state.isLoading ? "刷新中..." : "刷新"}
             </button>
@@ -1379,12 +1744,7 @@
   function buildMainBlockHtml(rows) {
     const statusBlock = state.isLoading ? `<div class="friend-monitor-state">正在抓好友农场、偷菜日志和体力状态，请等一下。</div>` : "";
     const rowsBlock = state.error ? `<div class="friend-monitor-error">数据加载失败：${escapeHtml(state.error)}</div>` : buildRowsHtml(rows);
-
-    if (isMobileViewport()) {
-      return [buildFilterHtml(), statusBlock, rowsBlock, buildSummaryHtml(), buildFootnoteHtml()].join("");
-    }
-
-    return [buildFilterHtml(), buildSummaryHtml(), statusBlock, rowsBlock, buildFootnoteHtml()].join("");
+    return [buildFilterHtml(), buildSummaryHtml(), buildAutoStealPanelHtml(), statusBlock, rowsBlock, buildFootnoteHtml()].join("");
   }
 
   function buildFilterHtml() {
@@ -1426,6 +1786,38 @@
         <span>${escapeHtml(label)}</span>
         <strong>${escapeHtml(value)}</strong>
         <em>${escapeHtml(tip)}</em>
+      </div>
+    `;
+  }
+
+  function buildAutoStealPanelHtml() {
+    const candidateCount = getAutoStealCandidateCount();
+    const resultsHtml =
+      autoStealState.recentResults.length > 0
+        ? `<div class="friend-monitor-auto-results">${autoStealState.recentResults
+            .map((result) => buildAutoStealResultHtml(result))
+            .join("")}</div>`
+        : `<div class="friend-monitor-state">自动偷取开启后，这里显示最近几次结果。</div>`;
+
+    return `
+      <div class="friend-monitor-auto-panel">
+        <div class="friend-monitor-auto-head">
+          <div>
+            <strong>自动偷取</strong>
+            <span>当前候选 ${escapeHtml(String(candidateCount))} 个，固定每 5 秒只尝试 1 个好友。</span>
+          </div>
+          <span class="friend-monitor-tip">${escapeHtml(getAutoStealStatusText())}</span>
+        </div>
+        ${resultsHtml}
+      </div>
+    `;
+  }
+
+  function buildAutoStealResultHtml(result) {
+    return `
+      <div class="friend-monitor-auto-result ${escapeHtml(result.kind)}">
+        <strong>${escapeHtml(`${result.timeText} · ${result.friendName}`)}</strong>
+        <span>${escapeHtml(result.text)}</span>
       </div>
     `;
   }
@@ -1675,7 +2067,7 @@
   function buildFootnoteHtml() {
     return `
       <div class="friend-monitor-footnote">
-        精确是否偷得到，由 <code>/api/farm/steal/friend</code> 在服务端判定。这个面板把成熟状态、当前轮偷取日志和同种理论余量放在一起看，适合先筛人，再点进好友页下手。
+        自动偷取会调用 <code>/api/farm/steal/friend-auto</code>，面板会把服务端返回的偷空结论回写到当前标签页状态。点击前的可偷判断仍旧来自成熟状态、偷取日志和理论余量估算。
       </div>
     `;
   }
@@ -1824,7 +2216,9 @@
       return;
     }
 
-    state.rows = snapshot.rows;
+    restoreFriendStealVerdicts(snapshot.friendStealVerdicts);
+    autoStealState.recentResults = snapshot.autoStealRecentResults;
+    state.rows = applyFriendStealVerdictsToRows(snapshot.rows);
     state.summary = snapshot.summary;
     state.updatedAt = snapshot.updatedAt;
     state.error = snapshot.error;
@@ -1852,6 +2246,8 @@
           summary: state.summary,
           updatedAt: state.updatedAt,
           error: state.error,
+          autoStealRecentResults: autoStealState.recentResults,
+          friendStealVerdicts: [...friendStealVerdictMap.values()],
         }),
       );
     } catch (error) {
@@ -1865,7 +2261,74 @@
       summary: snapshot?.summary && typeof snapshot.summary === "object" ? snapshot.summary : null,
       updatedAt: typeof snapshot?.updatedAt === "string" ? snapshot.updatedAt : "",
       error: typeof snapshot?.error === "string" ? snapshot.error : "",
+      autoStealRecentResults: normalizeAutoStealRecentResults(snapshot?.autoStealRecentResults),
+      friendStealVerdicts: normalizeFriendStealVerdictList(snapshot?.friendStealVerdicts),
     };
+  }
+
+  function normalizeAutoStealRecentResults(results) {
+    if (!Array.isArray(results)) {
+      return [];
+    }
+    return results
+      .map((result) => {
+        const kind = normalizeAutoStealResultKind(result?.kind);
+        const friendId = typeof result?.friendId === "string" ? result.friendId : "";
+        const friendName = typeof result?.friendName === "string" ? result.friendName : "未知好友";
+        const text = typeof result?.text === "string" ? result.text : "";
+        const timeText = typeof result?.timeText === "string" ? result.timeText : "";
+        if (!kind || !friendId || !text || !timeText) {
+          return null;
+        }
+        return {
+          id: typeof result?.id === "string" ? result.id : createTransientId(),
+          timeText,
+          friendId,
+          friendName,
+          kind,
+          text,
+        };
+      })
+      .filter(Boolean)
+      .slice(0, AUTO_STEAL_CONFIG.recentResultLimit);
+  }
+
+  function normalizeAutoStealResultKind(kind) {
+    return Object.values(AUTO_STEAL_RESULT_KIND).includes(kind) ? kind : "";
+  }
+
+  function normalizeFriendStealVerdictList(verdicts) {
+    if (!Array.isArray(verdicts)) {
+      return [];
+    }
+    return verdicts
+      .map((verdict) => {
+        const friendId = typeof verdict?.friendId === "string" ? verdict.friendId : "";
+        const farmSignature = typeof verdict?.farmSignature === "string" ? verdict.farmSignature : "";
+        const kind = normalizeFriendStealVerdictKind(verdict?.kind);
+        if (!friendId || !farmSignature || !kind) {
+          return null;
+        }
+        return {
+          friendId,
+          farmSignature,
+          kind,
+          text: typeof verdict?.text === "string" ? verdict.text : resolveFriendStealVerdictText(kind),
+          updatedAtMs: toFiniteNumber(verdict?.updatedAtMs, Date.now()),
+        };
+      })
+      .filter(Boolean);
+  }
+
+  function normalizeFriendStealVerdictKind(kind) {
+    return Object.values(FRIEND_STEAL_VERDICT_KIND).includes(kind) ? kind : "";
+  }
+
+  function restoreFriendStealVerdicts(verdicts) {
+    friendStealVerdictMap.clear();
+    for (const verdict of verdicts) {
+      friendStealVerdictMap.set(buildFriendStealVerdictKey(verdict.friendId, verdict.farmSignature), verdict);
+    }
   }
 
   function loadOpenState() {
@@ -2123,12 +2586,27 @@
     const response = await fetch(requestUrl, requestOptions);
     const payload = await response.json().catch(() => null);
     if (!response.ok) {
-      throw new Error(payload?.error?.message || payload?.message || `${response.status} ${response.statusText}`);
+      throw buildRequestError(response, payload);
     }
     if (payload && payload.success === false) {
-      throw new Error(payload.error?.message || payload.message || "接口失败");
+      throw buildRequestError(response, payload);
     }
     return payload;
+  }
+
+  function buildRequestError(response, payload) {
+    const error = new Error(payload?.error?.message || payload?.message || `${response.status} ${response.statusText}`);
+    error.code = payload?.error?.code ?? payload?.code ?? response.status;
+    error.payload = payload;
+    error.status = response.status;
+    return error;
+  }
+
+  function getErrorCode(error) {
+    if (!error || typeof error !== "object" || !("code" in error)) {
+      return null;
+    }
+    return toNullableNumber(error.code);
   }
 
   function buildRequestUrl(path) {
@@ -2200,6 +2678,19 @@
 
   function padNumber(value) {
     return String(value).padStart(2, "0");
+  }
+
+  function delay(milliseconds) {
+    return new Promise((resolve) => {
+      window.setTimeout(resolve, milliseconds);
+    });
+  }
+
+  function createTransientId() {
+    if (typeof crypto !== "undefined" && typeof crypto.randomUUID === "function") {
+      return crypto.randomUUID();
+    }
+    return `${Date.now().toString(36)}${Math.random().toString(36).slice(2, 10)}`;
   }
 
   function escapeHtml(value) {
