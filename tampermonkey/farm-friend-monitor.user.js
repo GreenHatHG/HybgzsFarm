@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         农场好友总览助手
 // @namespace    hybgzs-farm-helper
-// @version      0.1.6
+// @version      0.1.7
 // @description  汇总所有好友当前种植情况，显示成熟时间和偷菜前置判断
 // @match        https://cdk.hybgzs.com/entertainment/farm*
 // @match        https://cdk.hybgzs.com/entertainment/farm/*
