@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         农场好友总览助手
 // @namespace    hybgzs-farm-helper
-// @version      0.1.7
+// @version      0.1.8
 // @description  汇总所有好友当前种植情况，显示成熟时间和偷菜前置判断
 // @match        https://cdk.hybgzs.com/entertainment/farm*
 // @match        https://cdk.hybgzs.com/entertainment/farm/*
@@ -188,11 +188,7 @@
       if (currentToken !== loadToken) {
         return;
       }
-      state.rows = syncAutoStealFriendStatesForRows(snapshot.rows, snapshot.updatedAt.getTime()).sort(compareRows);
-      state.summary = snapshot.summary;
-      state.updatedAt = formatTime(snapshot.updatedAt);
-      state.error = "";
-      autoStealState.challengeRequired = false;
+      applySnapshot(snapshot);
     } catch (error) {
       if (currentToken !== loadToken) {
         return;
@@ -212,6 +208,14 @@
     }
   }
 
+  function applySnapshot(snapshot) {
+    state.rows = syncAutoStealFriendStatesForRows(snapshot.rows, snapshot.updatedAt.getTime()).sort(compareRows);
+    state.summary = snapshot.summary;
+    state.updatedAt = formatTime(snapshot.updatedAt);
+    state.error = "";
+    autoStealState.challengeRequired = false;
+  }
+
   async function collectSnapshot() {
     const [seedMap, friends, energyStatus] = await Promise.all([
       fetchSeedMap(),
@@ -228,6 +232,68 @@
       summary: buildSummary(rows, friends.length, energyStatus),
       updatedAt,
     };
+  }
+
+  async function refreshSingleFriendSnapshot(target) {
+    const [seedMap, energyStatus] = await Promise.all([fetchSeedMap(), fetchEnergyStatus()]);
+    const refreshedFriendRows = await buildFriendRows(
+      {
+        id: target.friendId,
+        username: target.friendName,
+        avatar: null,
+      },
+      seedMap,
+      energyStatus,
+    );
+    const updatedRows = replaceFriendRows(state.rows, target.friendId, refreshedFriendRows);
+    const rows = rebuildRowsWithEnergyStatus(updatedRows, energyStatus);
+    const updatedAt = new Date();
+    return {
+      rows,
+      summary: buildSummary(rows, resolveCurrentFriendCount(), energyStatus),
+      updatedAt,
+    };
+  }
+
+  function replaceFriendRows(rows, friendId, nextFriendRows) {
+    return rows.filter((row) => row.friendId !== friendId).concat(nextFriendRows);
+  }
+
+  function rebuildRowsWithEnergyStatus(rows, energyStatus) {
+    return rows.map((row) => rebuildRowBaseStateWithEnergyStatus(row, energyStatus));
+  }
+
+  function rebuildRowBaseStateWithEnergyStatus(row, energyStatus) {
+    const friendStealCost = resolveFriendStealCost(energyStatus);
+    const energyReady = canStealFriend(energyStatus, friendStealCost);
+    const plotsAvailable = hasAvailablePlots(row.currentRoundStolenPlots, row.currentRoundActivePlots);
+    const quantityAvailable = hasAvailableQuantityByEstimatedRemaining(row.estimatedRemaining);
+    const canAttempt = row.isMature && energyReady && plotsAvailable && quantityAvailable;
+    const status = resolveStatus(row, energyReady, plotsAvailable, quantityAvailable);
+    return {
+      ...row,
+      baseCanAttempt: canAttempt,
+      canAttempt,
+      baseStatusKey: status.key,
+      statusKey: status.key,
+      baseStatusText: status.text,
+      statusText: status.text,
+    };
+  }
+
+  function hasAvailableQuantityByEstimatedRemaining(estimatedRemaining) {
+    if (estimatedRemaining === null) {
+      return true;
+    }
+    return estimatedRemaining > 0;
+  }
+
+  function resolveCurrentFriendCount() {
+    const summaryFriendCount = toFiniteNumber(state.summary?.friendCount, Number.NaN);
+    if (Number.isFinite(summaryFriendCount) && summaryFriendCount >= 0) {
+      return Math.trunc(summaryFriendCount);
+    }
+    return new Set(state.rows.map((row) => row.friendId).filter(Boolean)).size;
   }
 
   async function fetchSeedMap() {
@@ -945,9 +1011,22 @@
       target.primaryRow?.farmSignature ?? "",
       AUTO_STEAL_FRIEND_STATE_KIND.recentSuccess,
     );
-    pushAutoStealResult(target, AUTO_STEAL_RESULT_KIND.success, "自动偷取请求成功，正在全量刷新确认结果");
+    pushAutoStealResult(target, AUTO_STEAL_RESULT_KIND.success, "自动偷取请求成功，正在刷新目标好友和体力状态");
     await delay(AUTO_STEAL_CONFIG.successRefreshDelayMs);
-    await loadData();
+    const currentToken = ++loadToken;
+    try {
+      const snapshot = await refreshSingleFriendSnapshot(target);
+      if (currentToken !== loadToken) {
+        return;
+      }
+      applySnapshot(snapshot);
+    } catch (error) {
+      if (currentToken !== loadToken) {
+        return;
+      }
+      console.error("[farm-friend-monitor] auto-steal-refresh", error);
+      state.error = `自动偷取成功，局部刷新失败：${toErrorMessage(error)}`;
+    }
   }
 
   function handleAutoStealFailure(target, error) {
@@ -2250,7 +2329,7 @@
   function buildFootnoteHtml() {
     return `
       <div class="friend-monitor-footnote">
-        自动偷取会调用 <code>/api/farm/steal/friend-auto</code>，面板会把服务端返回的偷取结果回写到当前标签页状态。点击前的基础判断仍旧来自成熟状态、偷取日志和理论余量估算。
+        自动偷取会调用 <code>/api/farm/steal/friend-auto</code>，成功后刷新目标好友和体力状态，再在当前标签页本地重算列表。点击前的基础判断仍旧来自成熟状态、偷取日志和理论余量估算。
       </div>
     `;
   }
