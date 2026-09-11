@@ -1,11 +1,11 @@
 // ==UserScript==
 // @name         农场最佳种植助手
 // @namespace    hybgzs-farm-helper
-// @version      0.2.0
+// @version      0.2.1
 // @description  算现在种什么更值（长期续种视角）
-// @match        https://cdk.hybgzs.com/entertainment/farm*
-// @match        https://cdk.hybgzs.com/entertainment/farm/*
-// @run-at       document-idle
+// @match        https://cdk.hybgzs.com/*
+// @run-at       document-start
+// @noframes
 // @grant        none
 // ==/UserScript==
 
@@ -73,6 +73,13 @@
   let resizeObserver = null;
   let dragState = null;
 
+  const FARM_PATH_PREFIX = "/entertainment/farm";
+  const MOUNT_CHECK_INTERVAL_MS = 500;
+
+  function isFarmPageUrl() {
+    return location.hostname === "cdk.hybgzs.com" && location.pathname.startsWith(FARM_PATH_PREFIX);
+  }
+
   function bootstrap() {
     if (booted) {
       return;
@@ -87,11 +94,26 @@
     maybeLoadDataForOpenWindow();
   }
 
-  if (document.readyState === "loading") {
-    document.addEventListener("DOMContentLoaded", bootstrap, { once: true });
-  } else {
-    bootstrap();
+  // 站点是 Next.js SPA：脚本可能比 React 接管页面更早，插入的面板随后被整个清掉；
+  // 也可能从站内其他页面经客户端路由第一次进入农场（Tampermonkey 不会重新注入）。
+  // 用轮询兜底：时机成熟才启动；启动后面板一旦被页面框架移除，就重新挂载并渲染。
+  function ensureMounted() {
+    if (!isFarmPageUrl() || !document.body) {
+      return;
+    }
+    if (!booted) {
+      bootstrap();
+      return;
+    }
+    if (!document.getElementById(APP_CONFIG.panelId)) {
+      render();
+    }
   }
+
+  ensureMounted();
+  window.setInterval(ensureMounted, MOUNT_CHECK_INTERVAL_MS);
+  document.addEventListener("visibilitychange", ensureMounted);
+  window.addEventListener("pageshow", ensureMounted);
 
   async function loadData() {
     const currentToken = ++loadToken;
