@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         农场最佳种植助手
 // @namespace    hybgzs-farm-helper
-// @version      0.2.1
-// @description  算现在种什么更值（长期续种视角）
+// @version      0.3.1
+// @description  算现在种什么更值（长期续种视角 + 贵种子省种子方案）
 // @match        https://cdk.hybgzs.com/*
 // @run-at       document-start
 // @noframes
@@ -20,12 +20,16 @@
     panelId: "farm-best-crop-panel",
     styleId: "farm-best-crop-style",
     refreshButtonId: "farm-best-crop-refresh",
+    rollingToggleButtonId: "farm-best-crop-rolling-toggle",
     toggleButtonId: "farm-best-crop-toggle",
     closeButtonId: "farm-best-crop-close",
     windowId: "farm-best-crop-window",
     dragHandleId: "farm-best-crop-drag-handle",
     storageKey: "farm-best-crop-window-state",
     marketFetchConcurrency: 4,
+    rollingHorizonDays: 90,
+    rollingMaxEvents: 3000,
+    rollingOvertakeEpsilon: 1,
     windowMargin: 16,
     defaultWindowWidth: 960,
     defaultWindowHeight: 720,
@@ -48,6 +52,8 @@
   const LONG_TERM_TABLE_TIP = "表里有全部信息，现在按续种每小时利润从高到低排。";
   const LONG_TERM_FOOTNOTE =
     "续种每小时利润 = 留 1 个继续种之后，剩下收成按交易所价格卖出，再除以生长小时。种子只在第一轮花钱，回本轮数越少越好，回本之后每一轮都是纯利润。";
+  const ROLLING_PLAN_FOOTNOTE =
+    "省种子算法按 1 个果子 = 1 颗种子算，种子钱按菜场单颗价乘数量估（挂单不够买齐时实际更贵），过程中不补买种子。";
 
   const PLOT_UNLOCK_STATUS_TEXT = Object.freeze({
     ready: "现在可开",
@@ -58,12 +64,21 @@
 
   const REPLANT_KEEP_QUANTITY = 1;
   const AVAILABLE_STATUS_KEYS = Object.freeze(["ok", "marketEmptyOfficial"]);
+  const ROLLING_PLAN_STATUS_TEXT = Object.freeze({
+    noPlots: "拿不到地块总数（/crops 接口），这个功能用不了",
+    noTarget: "现在没有值得种的品种，用不上",
+    cannotSpread: "这个品种一次只结 1 个果子，没法自己留种繁殖，只能一次买齐",
+    directBuy: "直接一次买齐就行，不用省这个钱",
+    rolling: "先买 1 颗慢慢铺满，别一次买齐",
+  });
   const state = {
     isLoading: false,
     error: "",
     rows: [],
     plotSummary: null,
     recommendedRow: null,
+    maxSlots: null,
+    rollingPlan: null,
     updatedAt: "",
   };
   const uiState = loadUiState();
@@ -130,6 +145,8 @@
       state.rows = snapshot.rows;
       state.plotSummary = snapshot.plotSummary;
       state.recommendedRow = snapshot.recommendedRow;
+      state.maxSlots = snapshot.maxSlots;
+      state.rollingPlan = null; // 展开时才重新算
       state.updatedAt = formatTime(snapshot.updatedAt);
       state.error = "";
     } catch (error) {
@@ -140,6 +157,8 @@
       state.rows = [];
       state.plotSummary = null;
       state.recommendedRow = null;
+      state.maxSlots = null;
+      state.rollingPlan = null;
       state.updatedAt = "";
       state.error = toErrorMessage(error);
     } finally {
@@ -159,11 +178,15 @@
   }
 
   async function collectSnapshot() {
-    const [seeds, recyclePriceMap, plotsInfo] = await Promise.all([
+    const [seeds, recyclePriceMap, plotsInfo, maxSlots] = await Promise.all([
       fetchSeeds(),
       fetchRecyclePriceMap(),
       fetchPlotsInfo().catch((error) => {
         console.warn("[farm-best-crop] plots", error);
+        return null;
+      }),
+      fetchFarmMaxSlots().catch((error) => {
+        console.warn("[farm-best-crop] maxSlots", error);
         return null;
       }),
     ]);
@@ -185,6 +208,7 @@
       rows: sortedRows,
       plotSummary,
       recommendedRow,
+      maxSlots,
       updatedAt: new Date(updatedAt),
     };
   }
@@ -225,6 +249,15 @@
   async function fetchPlotsInfo() {
     const response = await requestJson("/plots");
     return normalizePlotsInfo(response.data ?? null);
+  }
+
+  async function fetchFarmMaxSlots() {
+    const response = await requestJson("/crops");
+    const maxSlots = toNullableNumber(response.maxSlots);
+    if (!Number.isFinite(maxSlots)) {
+      throw new Error("地块数字段缺失");
+    }
+    return Math.max(0, Math.floor(maxSlots));
   }
 
   function normalizePlotsInfo(data) {
@@ -586,6 +619,259 @@
     return AVAILABLE_STATUS_KEYS.includes(row.statusKey);
   }
 
+  // ---------- 开荒计划（滚种模拟） ----------
+  //
+  // 场景：目标品种 X 续种利润最高但种子贵；先只买 k 颗 X，其余地块种首轮利润
+  // 最高的过渡品种 Y；X 的富余收成当种子去把 Y 地逐轮换成 X，Y 收成直接卖。
+  // 对 k = 1..N（k=N 即全买方案）逐个事件驱动模拟，比 90 天期末净利，选最优 k。
+
+  function buildRollingPlan(rows, maxSlots) {
+    const plotCount = Number.isFinite(maxSlots) ? Math.floor(maxSlots) : null;
+    if (!Number.isFinite(plotCount) || plotCount < 1) {
+      return { statusKey: "noPlots" };
+    }
+
+    const target = rows.find(isRecommendedCandidate) ?? null;
+    if (!target || !isRollingCropUsable(target)) {
+      return { statusKey: "noTarget", plotCount };
+    }
+    if (target.harvestQuantity < 2) {
+      return { statusKey: "cannotSpread", plotCount, target };
+    }
+
+    const transition = rows
+      .filter((row) =>
+        isAvailableCropRow(row) &&
+        row.seedId !== target.seedId &&
+        isRollingCropUsable(row) &&
+        Number.isFinite(row.hourlyProfit),
+      )
+      .sort((left, right) => right.hourlyProfit - left.hourlyProfit)[0] ?? null;
+
+    if (!transition) {
+      return {
+        statusKey: "directBuy",
+        plotCount,
+        target,
+        reasonText: "没有别的品种好过渡，直接一次买齐「" + target.name + "」。",
+      };
+    }
+
+    const simulations = [];
+    for (let initialXPlots = 1; initialXPlots <= plotCount; initialXPlots += 1) {
+      simulations.push(
+        simulateRollingSeeding({
+          plotCount,
+          initialXPlots,
+          target,
+          transition,
+        }),
+      );
+    }
+
+    const allBuySim = simulations[simulations.length - 1];
+    let bestIndex = simulations.length - 1;
+    for (let index = 0; index < simulations.length; index += 1) {
+      const candidate = simulations[index];
+      if (candidate.finalNet > simulations[bestIndex].finalNet + APP_CONFIG.rollingOvertakeEpsilon) {
+        bestIndex = index;
+      }
+    }
+
+    const bestSim = simulations[bestIndex];
+    const finalDelta = bestSim.finalNet - allBuySim.finalNet;
+    if (bestIndex >= simulations.length - 1 || finalDelta <= APP_CONFIG.rollingOvertakeEpsilon) {
+      const almostEqual = Math.abs(finalDelta) <= APP_CONFIG.rollingOvertakeEpsilon;
+      return {
+        statusKey: "directBuy",
+        plotCount,
+        target,
+        transition,
+        finalDelta,
+        reasonText: almostEqual
+          ? "算下来两种种法差不多，直接一次买齐省事。"
+          : "算下来直接一次买齐更划算：" + formatRollingHorizonLabel() + "下来能多赚 " +
+            formatCoin(Math.abs(finalDelta)) + "，省种子钱省不过赚的差价。",
+      };
+    }
+
+    return {
+      statusKey: "rolling",
+      plotCount,
+      target,
+      transition,
+      initialXPlots: bestIndex + 1,
+      upfrontCostRolling: bestSim.seedCost,
+      upfrontCostAllBuy: allBuySim.seedCost,
+      fullXSeconds: bestSim.fullXAt !== null ? bestSim.fullXAt / 1000 : null,
+      fullXRounds: bestSim.fullXAt !== null ? bestSim.fullXAt / 1000 / target.growthSeconds : null,
+      overtakeText: buildOvertakeText(bestSim.curve, allBuySim.curve),
+      finalDelta,
+      horizonDays: APP_CONFIG.rollingHorizonDays,
+    };
+  }
+
+  function formatRollingHorizonLabel() {
+    return "" + APP_CONFIG.rollingHorizonDays + " 天";
+  }
+
+  function isRollingCropUsable(row) {
+    return (
+      isAvailableCropRow(row) &&
+      Number.isFinite(row.buyOneTotal) &&
+      Number.isFinite(row.recyclePrice) &&
+      Number.isFinite(row.harvestQuantity) &&
+      row.harvestQuantity >= 1 &&
+      Number.isFinite(row.growthSeconds) &&
+      row.growthSeconds > 0
+    );
+  }
+
+  function simulateRollingSeeding({ plotCount, initialXPlots, target, transition }) {
+    const growthMs = {
+      x: target.growthSeconds * 1000,
+      y: transition.growthSeconds * 1000,
+    };
+    const harvestQty = {
+      x: Math.max(1, Math.floor(target.harvestQuantity)),
+      y: Math.max(1, Math.floor(transition.harvestQuantity)),
+    };
+    const unitPrice = {
+      x: target.recyclePrice,
+      y: transition.recyclePrice,
+    };
+    const seedCost =
+      initialXPlots * target.buyOneTotal + (plotCount - initialXPlots) * transition.buyOneTotal;
+
+    // 地块状态：cropId 为 null 表示空着等种子。曾经的 X 地不允许改种 Y
+    // （X 是利润主力，空等下一批 X 种子也比占着种 Y 强），只有原 Y 地才回种 Y。
+    const plots = [];
+    for (let index = 0; index < plotCount; index += 1) {
+      const isTarget = index < initialXPlots;
+      plots.push({
+        cropId: isTarget ? "x" : "y",
+        wasTarget: isTarget,
+        matureAt: growthMs[isTarget ? "x" : "y"],
+      });
+    }
+
+    const stock = { x: 0, y: 0 };
+    let net = -seedCost;
+    let fullXAt = null;
+    let eventCount = 0;
+    const curve = [{ at: 0, net }];
+
+    while (eventCount < APP_CONFIG.rollingMaxEvents) {
+      let now = Infinity;
+      for (const plot of plots) {
+        if (plot.matureAt < now) {
+          now = plot.matureAt;
+        }
+      }
+      if (!Number.isFinite(now) || now > APP_CONFIG.rollingHorizonDays * 24 * 3600 * 1000) {
+        break;
+      }
+      eventCount += 1;
+
+      const freedTargetPlots = [];
+      for (const plot of plots) {
+        if (plot.matureAt <= now) {
+          stock[plot.cropId] += harvestQty[plot.cropId];
+          plot.cropId = null;
+          if (plot.wasTarget) {
+            freedTargetPlots.push(plot);
+          }
+        }
+      }
+
+      // 先把 X 铺满空地（含刚收的 X 地自续），不够的空地用 Y 顶上，
+      // 剩余 Y 种子直接卖掉；X 种子库存留给后面解放出来的 Y 地。
+      for (const plot of plots) {
+        if (plot.cropId === null && stock.x > 0) {
+          plot.cropId = "x";
+          stock.x -= 1;
+          plot.matureAt = now + growthMs.x;
+        }
+      }
+      for (const plot of plots) {
+        if (plot.cropId === null && !plot.wasTarget && stock.y > 0) {
+          plot.cropId = "y";
+          stock.y -= 1;
+          plot.matureAt = now + growthMs.y;
+        }
+      }
+      net += stock.y * unitPrice.y;
+      stock.y = 0;
+
+      if (fullXAt === null && plots.every((plot) => plot.cropId === "x")) {
+        fullXAt = now;
+      }
+      curve.push({ at: now, net });
+
+      // 兜底：若所有 X 地都在等种子且再无事件，退出（正常不会发生，h>=2 保证自续）
+      if (freedTargetPlots.length > 0 && freedTargetPlots.every((plot) => plot.cropId === null)) {
+        const anyBusy = plots.some((plot) => plot.matureAt > now);
+        if (!anyBusy && stock.x === 0) {
+          break;
+        }
+      }
+    }
+
+    net += stock.x * unitPrice.x; // 期末清算剩余 X 种子
+    return {
+      seedCost,
+      finalNet: net,
+      fullXAt,
+      curve,
+    };
+  }
+
+  function buildOvertakeText(rollingCurve, allBuyCurve) {
+    const epsilon = APP_CONFIG.rollingOvertakeEpsilon;
+    const times = new Set();
+    for (const point of rollingCurve) times.add(point.at);
+    for (const point of allBuyCurve) times.add(point.at);
+    const sortedTimes = [...times].sort((left, right) => left - right);
+
+    const readNet = (curve, time) => {
+      let low = 0;
+      let high = curve.length - 1;
+      while (low < high) {
+        const mid = Math.ceil((low + high) / 2);
+        if (curve[mid].at <= time) {
+          low = mid;
+        } else {
+          high = mid - 1;
+        }
+      }
+      return curve[low].net;
+    };
+
+    let everBehind = false;
+    let everAhead = false;
+    let overtakeAt = null;
+    for (const time of sortedTimes) {
+      const delta = readNet(rollingCurve, time) - readNet(allBuyCurve, time);
+      if (delta < -epsilon) {
+        everBehind = true;
+      }
+      if (delta > epsilon) {
+        if (everBehind && overtakeAt === null) {
+          overtakeAt = time;
+        }
+        everAhead = true;
+      }
+    }
+
+    if (everBehind && overtakeAt !== null) {
+      return "刚开始会比一次买齐少赚一点，大约 " + formatDuration(overtakeAt / 1000) + " 之后就开始反超，越往后赚得越多。";
+    }
+    if (everAhead) {
+      return "每天都对过账：这么种，累计赚的钱从第一天到最后一天，一直都比一次买齐多。";
+    }
+    return "" + formatRollingHorizonLabel() + "的总账是更赚的，但中间有一阵子不如一次买齐。";
+  }
+
   function buildPlotSummary(rows, plotsInfo) {
     if (!plotsInfo) {
       return {
@@ -913,6 +1199,14 @@
         if (!state.isLoading) {
           void loadData();
         }
+      });
+    }
+
+    const rollingToggleButton = panel.querySelector(`#${APP_CONFIG.rollingToggleButtonId}`);
+    if (rollingToggleButton) {
+      rollingToggleButton.addEventListener("click", () => {
+        rollingExpanded = !rollingExpanded;
+        render();
       });
     }
 
@@ -1409,7 +1703,7 @@
       state.isLoading ? `<div class="farm-helper-state">正在抓接口并计算，请等一下。</div>` : "",
       state.error
         ? `<div class="farm-helper-error">数据加载失败：${escapeHtml(state.error)}</div>`
-        : [buildRecommendHtml(), buildTableHtml()].join(""),
+        : [buildRecommendHtml(), buildRollingPlanHtml(), buildTableHtml()].join(""),
     ].join("");
 
     return `
@@ -1445,8 +1739,108 @@
           <div class="farm-helper-card">
             ${mainBlock}
             <div class="farm-helper-footnote">
-              ${escapeHtml(LONG_TERM_FOOTNOTE)} 预计收菜时间 = 本次刷新时间 + 生长时间。菜场没货时种子价格按官方价算，菜场顺序不可信，脚本会自己排最低价。
+              ${escapeHtml(LONG_TERM_FOOTNOTE)} 预计收菜时间 = 本次刷新时间 + 生长时间。菜场没货时种子价格按官方价算，菜场顺序不可信，脚本会自己排最低价。${escapeHtml(ROLLING_PLAN_FOOTNOTE)}
             </div>
+          </div>
+        </div>
+      </div>
+    `;
+  }
+
+  let rollingExpanded = false;
+
+  // 展开时才算（模拟量不大，但没必要每次刷新都白算）
+  function ensureRollingPlan() {
+    if (state.rollingPlan || state.rows.length === 0) {
+      return;
+    }
+    try {
+      state.rollingPlan = buildRollingPlan(state.rows, state.maxSlots);
+    } catch (error) {
+      console.error("[farm-best-crop] rolling-plan", error);
+      state.rollingPlan = { statusKey: "noPlots" };
+    }
+  }
+
+  function buildRollingPlanHtml() {
+    const head = `
+      <div class="farm-helper-section-head">
+        <h3>贵种子省钱的种法（用于农场大更新第一次种植的时候）</h3>
+        <button
+          id="${APP_CONFIG.rollingToggleButtonId}"
+          class="farm-helper-button farm-helper-close-button"
+          type="button"
+        >${rollingExpanded ? "收起" : "展开看看"}</button>
+      </div>
+    `;
+
+    if (!rollingExpanded) {
+      return `
+        <div class="farm-helper-section">
+          ${head}
+          <div class="farm-helper-tip">某个品种种子很贵但种出来很赚时，帮你算：先买几颗、剩下的用收的果子当种子慢慢铺满，比一次买齐能省多少。</div>
+        </div>
+      `;
+    }
+
+    ensureRollingPlan();
+    const plan = state.rollingPlan;
+    if (!plan) {
+      return "";
+    }
+
+    if (plan.statusKey === "noPlots" || plan.statusKey === "noTarget") {
+      return `
+        <div class="farm-helper-section">
+          ${head}
+          <div class="farm-helper-empty">${escapeHtml(ROLLING_PLAN_STATUS_TEXT[plan.statusKey])}</div>
+        </div>
+      `;
+    }
+
+    const target = plan.target;
+    if (plan.statusKey === "cannotSpread") {
+      return `
+        <div class="farm-helper-section">
+          ${head}
+          <div class="farm-helper-empty">「${escapeHtml(target.name)}」${escapeHtml(ROLLING_PLAN_STATUS_TEXT.cannotSpread)}，靠回本轮数慢慢回本就行。</div>
+        </div>
+      `;
+    }
+
+    if (plan.statusKey === "directBuy") {
+      return `
+        <div class="farm-helper-section">
+          ${head}
+          <div class="farm-helper-empty">${escapeHtml(plan.reasonText ?? ROLLING_PLAN_STATUS_TEXT.directBuy)}</div>
+        </div>
+      `;
+    }
+
+    // statusKey === "rolling"
+    const fullXText = plan.fullXSeconds !== null
+      ? `约 ${escapeHtml(formatDuration(plan.fullXSeconds))}（${escapeHtml(formatRounds(plan.fullXRounds))}）`
+      : "" + formatRollingHorizonLabel() + "内没铺满，不划算";
+    const stepLines = [
+      `第 1 步：只买 ${plan.initialXPlots} 颗「${target.name}」种下，其余 ${plan.plotCount - plan.initialXPlots} 块地先种「${plan.transition.name}」卖钱。`,
+      `第 2 步：「${target.name}」每轮结 ${target.harvestQuantity} 个果子，用果子当种子把「${plan.transition.name}」的地一块块换过来，不用再花买种子钱。`,
+      `第 3 步：全部换成「${target.name}」后，每轮收的果子除了留种的全部卖掉。`,
+    ].map((line, index) => `<div>${escapeHtml(line)}</div>`).join("");
+
+    return `
+      <div class="farm-helper-section">
+        ${head}
+        <div class="farm-helper-recommend">
+          <div class="farm-helper-name">
+            <strong style="font-size: 20px;">先买 ${escapeHtml(String(plan.initialXPlots))} 颗「${escapeHtml(target.name)}」，别一次买齐</strong>
+          </div>
+          <div class="farm-helper-tip">这东西种子一颗 ${escapeHtml(formatCoin(target.buyOneTotal))}。${escapeHtml(String(plan.plotCount))} 块地要是一开始就全买种子，得花 ${escapeHtml(formatCoin(plan.upfrontCostAllBuy))}；先买 ${escapeHtml(String(plan.initialXPlots))} 颗才 ${escapeHtml(formatCoin(plan.upfrontCostRolling))}。等它结果子，留几个果子当种子，就能把所有地都种上这个，后面一分种子钱都不用再花。${escapeHtml(plan.overtakeText)}</div>
+          ${stepLines}
+          <div class="farm-helper-metrics">
+            ${buildMetricHtml("一次买齐要花", formatCoin(plan.upfrontCostAllBuy))}
+            ${buildMetricHtml("先买 " + plan.initialXPlots + " 颗只要花", formatCoin(plan.upfrontCostRolling))}
+            ${buildMetricHtml("全部换成它要", fullXText)}
+            ${buildMetricHtml(formatRollingHorizonLabel() + "下来多赚", formatCoin(plan.finalDelta))}
           </div>
         </div>
       </div>
