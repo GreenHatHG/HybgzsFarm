@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         农场最佳种植助手
 // @namespace    hybgzs-farm-helper
-// @version      0.3.1
+// @version      0.4.0
 // @description  算现在种什么更值（长期续种视角 + 贵种子省种子方案）
 // @match        https://cdk.hybgzs.com/*
 // @run-at       document-start
@@ -29,7 +29,7 @@
     marketFetchConcurrency: 4,
     rollingHorizonDays: 90,
     rollingMaxEvents: 3000,
-    rollingOvertakeEpsilon: 1,
+    rollingOvertakeEpsilon: 500_000, // 1 刀（原始币值），两方案期末净利差小于它视为"差不多"
     windowMargin: 16,
     defaultWindowWidth: 960,
     defaultWindowHeight: 720,
@@ -47,11 +47,11 @@
     noRecyclePrice: "无交易所价",
   });
 
-  const LONG_TERM_SCORE_LABEL = "续种每小时利润";
-  const LONG_TERM_TITLE_TIP = "先看推荐，再看全表。现在按续种每小时利润排。";
-  const LONG_TERM_TABLE_TIP = "表里有全部信息，现在按续种每小时利润从高到低排。";
+  const LONG_TERM_SCORE_LABEL = "续种每小时利润（Lv1 基准）";
+  const LONG_TERM_TITLE_TIP = "先看推荐，再看全表。按 Lv1 地上的续种每小时利润排。";
+  const LONG_TERM_TABLE_TIP = "表里有全部信息，按 Lv1 地上的续种每小时利润从高到低排。";
   const LONG_TERM_FOOTNOTE =
-    "续种每小时利润 = 留 1 个继续种之后，剩下收成按交易所价格卖出，再除以生长小时。种子只在第一轮花钱，回本轮数越少越好，回本之后每一轮都是纯利润。";
+    "续种每小时利润 = 留 1 个继续种之后，剩下收成按交易所价格卖出，再除以生长小时（按 Lv1 基准算，不含地块加成）。种子只在第一轮花钱，回本轮数越少越好，回本之后每一轮都是纯利润。全表里的「→最高级地」列是同一种子种在你现有最高级地上的表现，供参考。";
   const ROLLING_PLAN_FOOTNOTE =
     "省种子算法按 1 个果子 = 1 颗种子算，种子钱按菜场单颗价乘数量估（挂单不够买齐时实际更贵），过程中不补买种子。";
 
@@ -74,10 +74,12 @@
   const state = {
     isLoading: false,
     error: "",
+    warning: "",
     rows: [],
     plotSummary: null,
     recommendedRow: null,
     maxSlots: null,
+    plotLevels: null, // Map plotIndex -> 等级（1..maxLevel），从 /crops 的 yieldMultiplier 反推（unlockedPlotLevels 实测错位不可用）
     rollingPlan: null,
     updatedAt: "",
   };
@@ -146,9 +148,11 @@
       state.plotSummary = snapshot.plotSummary;
       state.recommendedRow = snapshot.recommendedRow;
       state.maxSlots = snapshot.maxSlots;
+      state.plotLevels = snapshot.plotLevels;
       state.rollingPlan = null; // 展开时才重新算
       state.updatedAt = formatTime(snapshot.updatedAt);
       state.error = "";
+      state.warning = snapshot.warning ?? "";
     } catch (error) {
       if (currentToken !== loadToken) {
         return;
@@ -158,6 +162,7 @@
       state.plotSummary = null;
       state.recommendedRow = null;
       state.maxSlots = null;
+      state.plotLevels = null;
       state.rollingPlan = null;
       state.updatedAt = "";
       state.error = toErrorMessage(error);
@@ -178,39 +183,90 @@
   }
 
   async function collectSnapshot() {
-    const [seeds, recyclePriceMap, plotsInfo, maxSlots] = await Promise.all([
+    const [seeds, recyclePriceMap, plotsInfo, cropsInfo, mechanics] = await Promise.all([
       fetchSeeds(),
       fetchRecyclePriceMap(),
       fetchPlotsInfo().catch((error) => {
         console.warn("[farm-best-crop] plots", error);
         return null;
       }),
-      fetchFarmMaxSlots().catch((error) => {
-        console.warn("[farm-best-crop] maxSlots", error);
+      fetchCropsInfo().catch((error) => {
+        console.warn("[farm-best-crop] crops", error);
+        return null;
+      }),
+      fetchMechanicsParams().catch((error) => {
+        console.warn("[farm-best-crop] mechanics", error);
         return null;
       }),
     ]);
 
+    const maxSlots = cropsInfo?.maxSlots ?? null;
+    // 地块等级唯一可靠来源：/crops 的 yieldMultiplier 反推（详见 farm-estimate-guide.md §2.1）。
+    // /plots 的 unlockedPlotLevels 实测与真实等级错位（2026-09-11），不可用。
+    const plotLevels = mergePlotLevels(cropsInfo?.crops ?? [], mechanics, plotsInfo?.plotLevels ?? null);
+
     const marketMap = await fetchMarketMap(seeds);
     const rawRows = await mapWithConcurrency(seeds, APP_CONFIG.marketFetchConcurrency, async (seed) =>
-      buildCropRow(seed, recyclePriceMap.get(seed.id) ?? null, marketMap.get(seed.id), plotsInfo?.nextUnlock ?? null),
+      buildCropRow(seed, recyclePriceMap.get(seed.id) ?? null, marketMap.get(seed.id), plotsInfo?.nextUnlock ?? null, mechanics, plotLevels),
     );
     const updatedAt = Date.now();
     const rows = rawRows.map((row) => ({
       ...row,
-      expectedHarvestAt: buildExpectedHarvestAt(updatedAt, row.growthSeconds),
+      // 预计收菜时间按「该种子能种到的最高级地块」算，和推荐口径一致
+      expectedHarvestAt: buildExpectedHarvestAt(updatedAt, row.bestGrowthSeconds ?? row.growthSeconds),
     }));
     const sortedRows = sortRows(rows);
     const plotSummary = buildPlotSummary(rows, plotsInfo);
     const recommendedRow = getRecommendedRow(sortedRows);
+    const warning = reconcileEstimate(cropsInfo?.crops ?? [], plotLevels, mechanics);
 
     return {
       rows: sortedRows,
       plotSummary,
       recommendedRow,
       maxSlots,
+      plotLevels,
+      warning,
       updatedAt: new Date(updatedAt),
     };
+  }
+
+  // 跨会话内存缓存：空地没有 yieldMultiplier，靠上一轮已种作物回填。
+  // 等级只在升级时变，缓存始终保留旧值，新作物返回权威值后更新。
+  const plotLevelCache = new Map();
+
+  function levelFromYieldMultiplier(yieldMultiplier, mechanics) {
+    if (!mechanics || !mechanics.yieldPct) {
+      return null;
+    }
+    // 服务端可能舍入（1+0.3333×6=2.9998→3），用 round 容差
+    const level = Math.round((yieldMultiplier - 1) / (mechanics.yieldPct / 100)) + 1;
+    if (!Number.isFinite(level) || level < 1 || level > mechanics.maxLevel) {
+      return null;
+    }
+    return level;
+  }
+
+  function mergePlotLevels(crops, mechanics, fallbackLevels) {
+    // 1) 先用上一轮缓存铺底（空地也能保留等级）
+    const merged = new Map(plotLevelCache);
+    // 2) 用本轮已种作物的权威 yieldMultiplier 覆盖/回填缓存
+    for (const crop of crops) {
+      const ym = toNullableNumber(crop.yieldMultiplier);
+      if (ym === null || crop.plotIndex === undefined || crop.plotIndex === null) {
+        continue;
+      }
+      const level = levelFromYieldMultiplier(ym, mechanics);
+      if (level !== null) {
+        merged.set(String(crop.plotIndex), level);
+        plotLevelCache.set(String(crop.plotIndex), level);
+      }
+    }
+    if (merged.size > 0) {
+      return merged;
+    }
+    // 3) 无任何权威来源时才退回不可靠的 unlockedPlotLevels（聊胜于无）
+    return fallbackLevels;
   }
 
   async function fetchSeeds() {
@@ -251,19 +307,51 @@
     return normalizePlotsInfo(response.data ?? null);
   }
 
-  async function fetchFarmMaxSlots() {
+  // 一次 GET 拿地块加成系数（静态配置，基本不变）；拿不到时全部按 Lv1 降级
+  async function fetchMechanicsParams() {
+    const response = await requestJson("/codex/mechanics");
+    return normalizeMechanicsParams(response?.data ?? null);
+  }
+
+  function normalizeMechanicsParams(data) {
+    const p = data?.params?.plots;
+    if (!p || typeof p !== "object") {
+      return null;
+    }
+    const maxLevel = toNullableNumber(p.upgradeMaxLevel);
+    const yieldPct = toNullableNumber(p.yieldPercentPerLevel);
+    const speedPct = toNullableNumber(p.growthSpeedPercentPerLevel);
+    if (maxLevel === null || yieldPct === null || speedPct === null) {
+      return null;
+    }
+    return { maxLevel, yieldPct, speedPct };
+  }
+
+  async function fetchCropsInfo() {
     const response = await requestJson("/crops");
     const maxSlots = toNullableNumber(response.maxSlots);
     if (!Number.isFinite(maxSlots)) {
       throw new Error("地块数字段缺失");
     }
-    return Math.max(0, Math.floor(maxSlots));
+    return {
+      maxSlots: Math.max(0, Math.floor(maxSlots)),
+      crops: Array.isArray(response.crops) ? response.crops : [],
+    };
   }
 
   function normalizePlotsInfo(data) {
     if (!data || typeof data !== "object") {
       return null;
     }
+
+    const levelsRaw = data.unlockedPlotLevels && typeof data.unlockedPlotLevels === "object" ? data.unlockedPlotLevels : null;
+    const plotLevels = levelsRaw
+      ? new Map(
+          Object.entries(levelsRaw)
+            .map(([index, level]) => [String(index), Math.floor(Number(level))])
+            .filter(([index, level]) => index !== "" && Number.isFinite(level) && level >= 1),
+        )
+      : null;
 
     const nextUnlockRaw = data.nextUnlock && typeof data.nextUnlock === "object" ? data.nextUnlock : null;
     const vipPlotStartIndex = toNullableNumber(data.vipPlotStartIndex);
@@ -282,6 +370,7 @@
       nextUnlockIsVip: nextUnlock ? isVipPlotIndex(nextUnlock.plotIndex, vipPlotStartIndex, vipPlotEndIndex) : false,
       vipPlotEndIndex,
       vipPlotStartIndex,
+      plotLevels,
     };
   }
 
@@ -333,7 +422,7 @@
     return left.id.localeCompare(right.id);
   }
 
-  async function buildCropRow(seed, recyclePrice, marketSnapshot, nextUnlock) {
+  async function buildCropRow(seed, recyclePrice, marketSnapshot, nextUnlock, mechanics, plotLevels) {
     const listings = marketSnapshot?.listings ?? [];
     const marketError = marketSnapshot?.error ?? "";
     const marketTotalQuantity = listings.reduce((sum, item) => sum + item.quantity, 0);
@@ -363,6 +452,19 @@
       replantProfit !== null && seed.growthSeconds > 0 ? replantProfit / (seed.growthSeconds / 3600) : null;
     const hourlyProfit =
       roundProfit !== null && seed.growthSeconds > 0 ? roundProfit / (seed.growthSeconds / 3600) : null;
+
+    // 地块加成：只信接口给的系数，没有就全部按 Lv1（不猜数字）。
+    // best* = 种在现有最高级地上的值（拿种子最快、续种最赚），base* = Lv1 基准。
+    const bestLevel = plotLevels && mechanics ? Math.max(...plotLevels.values()) : 1;
+    const bestMul = mechanics && bestLevel > 1 ? buildPlotMultiplier(bestLevel, mechanics) : null;
+    const bestGrowthSeconds = bestMul ? Math.round(seed.growthSeconds * bestMul.timeMul) : seed.growthSeconds;
+    const bestQuantity = bestMul ? Math.max(1, Math.round(seed.harvestQuantity * bestMul.yieldMul)) : seed.harvestQuantity;
+    const bestReplantProfit = bestMul && recyclePrice !== null ? Math.max(bestQuantity - REPLANT_KEEP_QUANTITY, 0) * recyclePrice : replantProfit;
+    const bestReplantHourlyProfit =
+      bestReplantProfit !== null && bestGrowthSeconds > 0 ? bestReplantProfit / (bestGrowthSeconds / 3600) : null;
+    const bestReplantBreakEvenRounds = bestMul
+      ? buildReplantBreakEvenRounds({ roundSaleAmount: bestQuantity * (recyclePrice ?? 0), replantProfit: bestReplantProfit, buyOneTotal })
+      : replantBreakEvenRounds;
     const replantBreakEvenRounds = buildReplantBreakEvenRounds({
       roundSaleAmount,
       replantProfit,
@@ -397,6 +499,14 @@
       replantBreakEvenRounds,
       hourlyProfit,
       officialDiff,
+      bestLevel,
+      bestGrowthSeconds,
+      bestQuantity,
+      bestReplantProfit,
+      bestReplantHourlyProfit,
+      bestReplantBreakEvenRounds,
+      bestYieldMul: bestMul ? bestMul.yieldMul : 1,
+      bestTimeMul: bestMul ? bestMul.timeMul : 1,
       statusKey: status.key,
       statusText: status.text,
     };
@@ -406,6 +516,79 @@
       ...row,
       ...plotBreakEven,
     };
+  }
+
+  function buildPlotMultiplier(level, mechanics) {
+    const n = Math.max(0, level - 1);
+    return {
+      // 和指南公式一致：产量每级 +yieldPct%，时长每级 −speedPct%。
+      // 服务端可能对倍数四舍五入（如 2.9998→3），对账时留 ±1% 容差。
+      yieldMul: 1 + (mechanics.yieldPct / 100) * n,
+      timeMul: 1 - (mechanics.speedPct / 100) * n,
+    };
+  }
+
+  // 运行时对账：用服务端算好的 yieldMultiplier / maturesAt 反推，
+  // 和本地公式比对，不一致说明网站改了算法，提示更新脚本。
+  function reconcileEstimate(crops, plotLevels, mechanics) {
+    if (!mechanics || !plotLevels || !Array.isArray(crops)) {
+      return "";
+    }
+    for (const crop of crops) {
+      const level = plotLevels.get(String(crop.plotIndex));
+      if (!level) {
+        continue;
+      }
+      const { yieldMul, timeMul } = buildPlotMultiplier(level, mechanics);
+      const serverYield = toNullableNumber(crop.yieldMultiplier);
+      const serverTime = toNullableNumber(crop.remainingTime);
+      const plantedAt = Date.parse(crop.plantedAt ?? "");
+      const maturesAt = Date.parse(crop.maturesAt ?? "");
+      if (serverYield !== null && Math.abs(serverYield - yieldMul) / yieldMul > 0.01) {
+        // 调试：把对账失败的全原始上下文打到控制台，方便复制反馈
+        console.log("[farm-helper] 产量对账失败", {
+          对账公式: `yieldMul = 1 + yieldPct/100 × (level-1)`,
+          mechanics,
+          本地计算: { level, yieldMul },
+          本地plotLevels快照: [...plotLevels.entries()],
+          服务端返回: {
+            plotIndex: crop.plotIndex,
+            yieldMultiplier: crop.yieldMultiplier,
+            remainingTime: crop.remainingTime,
+            plantedAt: crop.plantedAt,
+            maturesAt: crop.maturesAt,
+          },
+          服务端完整crop对象: crop,
+        });
+        return `产量对不上（本算 ${yieldMul.toFixed(2)}，服务端 ${serverYield}），算法可能已改，请更新脚本`;
+      }
+      if (
+        serverTime !== null &&
+        Number.isFinite(plantedAt) &&
+        Number.isFinite(maturesAt) &&
+        Math.abs((maturesAt - Date.now()) / 1000 - serverTime) > 60
+      ) {
+        console.log("[farm-helper] 时长对账失败", {
+          调试说明: "remainingTime 是剩余秒数（≈maturesAt−now），不是总时长",
+          mechanics,
+          本地计算: {
+            level,
+            timeMul,
+            期望剩余: (maturesAt - Date.now()) / 1000,
+            参考总时长: (maturesAt - plantedAt) / 1000,
+          },
+          服务端返回: {
+            plotIndex: crop.plotIndex,
+            remainingTime: crop.remainingTime,
+            plantedAt: crop.plantedAt,
+            maturesAt: crop.maturesAt,
+          },
+          服务端完整crop对象: crop,
+        });
+        return "时长字段对不上，请更新脚本";
+      }
+    }
+    return "";
   }
 
   function buildReplantBreakEvenRounds(context) {
@@ -644,9 +827,9 @@
         isAvailableCropRow(row) &&
         row.seedId !== target.seedId &&
         isRollingCropUsable(row) &&
-        Number.isFinite(row.hourlyProfit),
+        Number.isFinite(row.replantHourlyProfit),
       )
-      .sort((left, right) => right.hourlyProfit - left.hourlyProfit)[0] ?? null;
+      .sort((left, right) => right.replantHourlyProfit - left.replantHourlyProfit)[0] ?? null;
 
     if (!transition) {
       return {
@@ -689,7 +872,8 @@
         transition,
         finalDelta,
         reasonText: almostEqual
-          ? "算下来两种种法差不多，直接一次买齐省事。"
+          ? "算下来两种种法差不多（相差 " + formatCoin(Math.abs(finalDelta)) +
+            "，不到阈值 " + formatCoin(APP_CONFIG.rollingOvertakeEpsilon) + "），直接一次买齐省事。"
           : "算下来直接一次买齐更划算：" + formatRollingHorizonLabel() + "下来能多赚 " +
             formatCoin(Math.abs(finalDelta)) + "，省种子钱省不过赚的差价。",
       };
@@ -704,7 +888,8 @@
       upfrontCostRolling: bestSim.seedCost,
       upfrontCostAllBuy: allBuySim.seedCost,
       fullXSeconds: bestSim.fullXAt !== null ? bestSim.fullXAt / 1000 : null,
-      fullXRounds: bestSim.fullXAt !== null ? bestSim.fullXAt / 1000 / target.growthSeconds : null,
+      fullXRounds:
+        bestSim.fullXAt !== null ? bestSim.fullXAt / 1000 / target.bestGrowthSeconds : null,
       overtakeText: buildOvertakeText(bestSim.curve, allBuySim.curve),
       finalDelta,
       horizonDays: APP_CONFIG.rollingHorizonDays,
@@ -726,14 +911,15 @@
       row.growthSeconds > 0
     );
   }
-
   function simulateRollingSeeding({ plotCount, initialXPlots, target, transition }) {
+    // 口径：第一颗 X 种在现有最高级田上，收获最快、产量最高，扩散速度按
+    // bestGrowthSeconds / bestQuantity 算；其余田种的过渡作物 Y 按 Lv1 基准算。
     const growthMs = {
-      x: target.growthSeconds * 1000,
+      x: target.bestGrowthSeconds * 1000,
       y: transition.growthSeconds * 1000,
     };
     const harvestQty = {
-      x: Math.max(1, Math.floor(target.harvestQuantity)),
+      x: Math.max(1, Math.floor(target.bestQuantity)),
       y: Math.max(1, Math.floor(transition.harvestQuantity)),
     };
     const unitPrice = {
@@ -1703,7 +1889,12 @@
       state.isLoading ? `<div class="farm-helper-state">正在抓接口并计算，请等一下。</div>` : "",
       state.error
         ? `<div class="farm-helper-error">数据加载失败：${escapeHtml(state.error)}</div>`
-        : [buildRecommendHtml(), buildRollingPlanHtml(), buildTableHtml()].join(""),
+        : [
+            state.warning ? `<div class="farm-helper-error">⚠ ${escapeHtml(state.warning)}</div>` : "",
+            buildRecommendHtml(),
+            buildRollingPlanHtml(),
+            buildTableHtml(),
+          ].join(""),
     ].join("");
 
     return `
@@ -1878,7 +2069,7 @@
                 </span>
                 <span class="farm-helper-status ${statusTone}">${escapeHtml(row.statusText)}</span>
               </div>
-              <div class="farm-helper-tip">按长期续种算：首购只花一次钱，回本后每轮都是纯赚。</div>
+              <div class="farm-helper-tip">按长期续种算（Lv1 基准，不含地块加成）：首购只花一次钱，回本后每轮都是纯赚。贵种子应优先种在你现有的最高级地上。</div>
               <div class="farm-helper-tip">
                 生长 ${escapeHtml(formatDuration(row.growthSeconds))}，单块收 ${escapeHtml(String(row.harvestQuantity))} 个，预计 ${escapeHtml(formatDateTime(row.expectedHarvestAt))} 收。
               </div>
@@ -1944,9 +2135,9 @@
                 </span>
               </div>
             </td>
-            <td>${escapeHtml(formatDuration(row.growthSeconds))}</td>
-            <td>${escapeHtml(String(row.harvestQuantity))}</td>
-            <td>${buildTableValue(formatCoin(row.replantHourlyProfit), replantHourlyTone)}</td>
+            <td>${escapeHtml(formatDuration(row.growthSeconds))} → ${escapeHtml(formatDuration(row.bestGrowthSeconds))}</td>
+            <td>${escapeHtml(String(row.harvestQuantity))} → ${escapeHtml(String(row.bestQuantity))}</td>
+            <td>${escapeHtml(formatCoin(row.replantHourlyProfit))}</td>
             <td>${escapeHtml(formatCoin(row.replantProfit))}</td>
             <td>${escapeHtml(formatCoin(row.roundProfit))}</td>
             <td>${escapeHtml(formatCoin(row.hourlyProfit))}</td>
@@ -1973,10 +2164,10 @@
               <tr>
                 <th>序</th>
                 <th>作物</th>
-                <th>生长</th>
-                <th>单块收获</th>
-                <th>续种每小时利润</th>
-                <th>续种单轮利润</th>
+                <th>生长（→最高级地）</th>
+                <th>单块收获（→最高级地）</th>
+                <th>续种每小时利润（Lv1）</th>
+                <th>续种单轮利润（Lv1）</th>
                 <th>首轮利润</th>
                 <th>首轮每小时利润</th>
                 <th>交易所卖出单价</th>
