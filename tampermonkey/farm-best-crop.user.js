@@ -335,10 +335,6 @@
       roundProfit !== null && seed.growthSeconds > 0
         ? roundProfit / (seed.growthSeconds / 3600)
         : null;
-    const costPerformance =
-      Number.isFinite(buyOneTotal) && hourlyProfit !== null && buyOneTotal > 0
-        ? hourlyProfit / buyOneTotal
-        : null;
     const officialDiff = marketMinUnitPrice !== null ? seed.officialSeedPrice - marketMinUnitPrice : null;
 
     const status = resolveRowStatus({
@@ -365,7 +361,6 @@
       replantSaleQuantity,
       replantProfit,
       hourlyProfit,
-      costPerformance,
       officialDiff,
       statusKey: status.key,
       statusText: status.text,
@@ -384,28 +379,24 @@
       return {
         plotBreakEvenRounds: null,
         plotBreakEvenSeconds: null,
-        plotBreakEvenSurplus: null,
       };
     }
     if (!Number.isFinite(row.roundProfit) || !Number.isFinite(row.replantProfit) || row.growthSeconds <= 0) {
       return {
         plotBreakEvenRounds: null,
         plotBreakEvenSeconds: null,
-        plotBreakEvenSurplus: null,
       };
     }
     if (row.roundProfit >= unlockCost) {
       return {
         plotBreakEvenRounds: 1,
         plotBreakEvenSeconds: row.growthSeconds,
-        plotBreakEvenSurplus: row.roundProfit - unlockCost,
       };
     }
     if (row.replantProfit <= 0) {
       return {
         plotBreakEvenRounds: Infinity,
         plotBreakEvenSeconds: Infinity,
-        plotBreakEvenSurplus: null,
       };
     }
 
@@ -415,7 +406,6 @@
     return {
       plotBreakEvenRounds: totalRounds,
       plotBreakEvenSeconds: totalRounds * row.growthSeconds,
-      plotBreakEvenSurplus: cumulativeProfit - unlockCost,
     };
   }
 
@@ -1506,7 +1496,7 @@
           <div class="farm-helper-card">
             ${mainBlock}
             <div class="farm-helper-footnote">
-              ${escapeHtml(profitTabConfig.footnote)} 预计收菜时间 = 本次刷新时间 + 生长时间。收完回本 = 收完这一轮后，累计利润第一次覆盖开地成本。回本当轮结余 = 这一轮收完后，超过开地成本的那部分。菜场没货时按官方价算，菜场顺序不可信，脚本会自己排最低价。
+              ${escapeHtml(profitTabConfig.footnote)} 预计收菜时间 = 本次刷新时间 + 生长时间。菜场没货时按官方价算，菜场顺序不可信，脚本会自己排最低价。
             </div>
           </div>
         </div>
@@ -1587,14 +1577,10 @@
             </div>
           </div>
           <div class="farm-helper-metrics">
-            ${buildMetricHtml("性价比", formatRatio(row.costPerformance))}
             ${buildMetricHtml("每小时利润", formatCoin(row.hourlyProfit))}
             ${buildMetricHtml("买1个实际总价", formatPurchase(row.buyOneResult))}
             ${buildMetricHtml("单轮利润", formatCoin(row.roundProfit))}
             ${buildMetricHtml("续种利润", formatCoin(row.replantProfit))}
-            ${buildMetricHtml("收完回本时间", formatBreakEvenDuration(row.plotBreakEvenSeconds))}
-            ${buildMetricHtml("第几轮收完回本", formatBreakEvenRounds(row.plotBreakEvenRounds))}
-            ${buildMetricHtml("回本当轮结余", formatBreakEvenSurplus(row.plotBreakEvenSurplus))}
             ${buildMetricHtml("预计收菜时间", formatDateTime(row.expectedHarvestAt))}
             ${buildMetricHtml("交易所单价", formatCoin(row.recyclePrice))}
             ${buildMetricHtml("菜场最低单价", formatCoin(row.marketMinUnitPrice))}
@@ -1636,8 +1622,6 @@
     const plotTypeText = summary.nextUnlockIsVip ? "VIP地块" : "普通地块";
     const bestCropText = bestRow ? bestRow.name : "暂时算不出";
     const bestTimeText = bestRow ? formatBreakEvenDuration(bestRow.plotBreakEvenSeconds) : "--";
-    const bestRoundsText = bestRow ? formatBreakEvenRounds(bestRow.plotBreakEvenRounds) : "--";
-    const bestSurplusText = bestRow ? formatBreakEvenSurplus(bestRow.plotBreakEvenSurplus) : "--";
 
     return `
       <div class="farm-helper-section">
@@ -1655,7 +1639,6 @@
               <div class="farm-helper-tip">
                 开地成本 ${escapeHtml(formatCoin(summary.nextUnlock.cost))}，${escapeHtml(summary.statusText)}。
               </div>
-              <div class="farm-helper-tip">回本按收完该轮后的累计利润计算，回本当轮结余会单独显示。</div>
             </div>
             <div class="farm-helper-score">
               <span>最快收完回本</span>
@@ -1667,9 +1650,6 @@
             ${buildMetricHtml("地块类型", plotTypeText)}
             ${buildMetricHtml("所需等级", formatLevel(summary.nextUnlock.requiredLevel))}
             ${buildMetricHtml("最快回本作物", bestCropText)}
-            ${buildMetricHtml("第几轮收完回本", bestRoundsText)}
-            ${buildMetricHtml("收完回本时间", bestTimeText)}
-            ${buildMetricHtml("回本当轮结余", bestSurplusText)}
           </div>
         </div>
       </div>
@@ -1711,12 +1691,8 @@
             <td>${buildTableValue(formatPurchase(row.buyOneResult), buyOneTone)}</td>
             <td>${escapeHtml(formatCoin(row.roundProfit))}</td>
             <td>${escapeHtml(formatCoin(row.replantProfit))}</td>
-            <td>${escapeHtml(formatBreakEvenRounds(row.plotBreakEvenRounds))}</td>
-            <td>${escapeHtml(formatBreakEvenDuration(row.plotBreakEvenSeconds))}</td>
-            <td>${escapeHtml(formatBreakEvenSurplus(row.plotBreakEvenSurplus))}</td>
             <td>${escapeHtml(formatCoin(row.hourlyProfit))}</td>
             <td>${escapeHtml(formatDateTime(row.expectedHarvestAt))}</td>
-            <td>${escapeHtml(formatRatio(row.costPerformance))}</td>
             <td>${escapeHtml(formatCoin(row.officialSeedPrice))}</td>
             <td>${buildTableValue(formatCoin(row.officialDiff), officialDiffTone)}</td>
             <td><span class="farm-helper-status ${statusTone}">${escapeHtml(row.statusText)}</span></td>
@@ -1744,12 +1720,8 @@
                 <th>买1个实际总价</th>
                 <th>单轮利润</th>
                 <th>续种利润</th>
-                <th>第几轮收完回本</th>
-                <th>收完回本时间</th>
-                <th>回本当轮结余</th>
                 <th>每小时利润</th>
                 <th>预计收菜时间</th>
-                <th>性价比</th>
                 <th>官方种子单价</th>
                 <th>官方价差</th>
                 <th>状态</th>
@@ -1872,28 +1844,6 @@
     })}刀`;
   }
 
-  function formatRatio(value) {
-    if (!Number.isFinite(value)) {
-      return "--";
-    }
-    const absoluteValue = Math.abs(value);
-    const digits = absoluteValue >= 1 ? 4 : 6;
-    return value.toLocaleString("zh-CN", {
-      minimumFractionDigits: 0,
-      maximumFractionDigits: digits,
-    });
-  }
-
-  function formatBreakEvenRounds(value) {
-    if (value === Infinity) {
-      return "回不了本";
-    }
-    if (!Number.isFinite(value)) {
-      return "--";
-    }
-    return `${value}轮`;
-  }
-
   function formatBreakEvenDuration(seconds) {
     if (seconds === Infinity) {
       return "回不了本";
@@ -1918,16 +1868,6 @@
       return `${minutes}分`;
     }
     return `${seconds}秒`;
-  }
-
-  function formatBreakEvenSurplus(value) {
-    if (!Number.isFinite(value)) {
-      return "--";
-    }
-    if (value === 0) {
-      return "正好回本";
-    }
-    return formatCoin(value);
   }
 
   function formatDuration(seconds) {
