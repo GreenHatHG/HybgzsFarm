@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         农场最佳种植助手
 // @namespace    hybgzs-farm-helper
-// @version      0.4.0
+// @version      0.5.0
 // @description  算现在种什么更值（长期续种视角 + 贵种子省种子方案）
 // @match        https://cdk.hybgzs.com/*
 // @run-at       document-start
@@ -28,6 +28,9 @@
     storageKey: "farm-best-crop-window-state",
     marketFetchConcurrency: 4,
     rollingHorizonDays: 90,
+    // 滚种比较只看前几轮：铺满目标作物后再收 targetRoundsAfterFull 轮即结算，
+    // 避免 90 天长期口径掩盖「前期滚种赢、后期全买反超」的交叉。
+    rollingTargetRoundsAfterFull: 2,
     rollingMaxEvents: 3000,
     rollingOvertakeEpsilon: 500_000, // 1 刀（原始币值），两方案期末净利差小于它视为"差不多"
     windowMargin: 16,
@@ -891,6 +894,8 @@
       fullXRounds:
         bestSim.fullXAt !== null ? bestSim.fullXAt / 1000 / target.bestGrowthSeconds : null,
       overtakeText: buildOvertakeText(bestSim.curve, allBuySim.curve),
+      scopeNote: "注意：这里的比较只覆盖前期（铺满「" + target.name + "」后约 " +
+        APP_CONFIG.rollingTargetRoundsAfterFull + " 轮），不代表长期账。",
       finalDelta,
       horizonDays: APP_CONFIG.rollingHorizonDays,
     };
@@ -911,6 +916,15 @@
       row.growthSeconds > 0
     );
   }
+  // 结算点 = 全部地块铺满目标作物后，再收 targetRoundsAfterFull 轮目标作物。
+  // 铺满时间拿不到时（理论上不会发生），退回 rollingHorizonDays 时间上限。
+  function buildRollingDeadlineMs(fullXAt, target) {
+    if (fullXAt === null || !Number.isFinite(target.bestGrowthSeconds)) {
+      return APP_CONFIG.rollingHorizonDays * 24 * 3600 * 1000;
+    }
+    return fullXAt + APP_CONFIG.rollingTargetRoundsAfterFull * target.bestGrowthSeconds * 1000;
+  }
+
   function simulateRollingSeeding({ plotCount, initialXPlots, target, transition }) {
     // 口径：第一颗 X 种在现有最高级田上，收获最快、产量最高，扩散速度按
     // bestGrowthSeconds / bestQuantity 算；其余田种的过渡作物 Y 按 Lv1 基准算。
@@ -954,7 +968,8 @@
           now = plot.matureAt;
         }
       }
-      if (!Number.isFinite(now) || now > APP_CONFIG.rollingHorizonDays * 24 * 3600 * 1000) {
+      const deadlineMs = buildRollingDeadlineMs(fullXAt, target);
+      if (!Number.isFinite(now) || now > deadlineMs) {
         break;
       }
       eventCount += 1;
@@ -2025,7 +2040,7 @@
           <div class="farm-helper-name">
             <strong style="font-size: 20px;">先买 ${escapeHtml(String(plan.initialXPlots))} 颗「${escapeHtml(target.name)}」，别一次买齐</strong>
           </div>
-          <div class="farm-helper-tip">这东西种子一颗 ${escapeHtml(formatCoin(target.buyOneTotal))}。${escapeHtml(String(plan.plotCount))} 块地要是一开始就全买种子，得花 ${escapeHtml(formatCoin(plan.upfrontCostAllBuy))}；先买 ${escapeHtml(String(plan.initialXPlots))} 颗才 ${escapeHtml(formatCoin(plan.upfrontCostRolling))}。等它结果子，留几个果子当种子，就能把所有地都种上这个，后面一分种子钱都不用再花。${escapeHtml(plan.overtakeText)}</div>
+          <div class="farm-helper-tip">这东西种子一颗 ${escapeHtml(formatCoin(target.buyOneTotal))}。${escapeHtml(String(plan.plotCount))} 块地要是一开始就全买种子，得花 ${escapeHtml(formatCoin(plan.upfrontCostAllBuy))}；先买 ${escapeHtml(String(plan.initialXPlots))} 颗才 ${escapeHtml(formatCoin(plan.upfrontCostRolling))}。等它结果子，留几个果子当种子，就能把所有地都种上这个，后面一分种子钱都不用再花。${escapeHtml(plan.overtakeText)}${plan.scopeNote ? " " + escapeHtml(plan.scopeNote) : ""}</div>
           ${stepLines}
           <div class="farm-helper-metrics">
             ${buildMetricHtml("一次买齐要花", formatCoin(plan.upfrontCostAllBuy))}
