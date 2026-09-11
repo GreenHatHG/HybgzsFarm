@@ -36,7 +36,7 @@
   const STATUS_TEXT = Object.freeze({
     ok: "可买",
     marketEmpty: "菜场没货",
-    marketEmptyOfficial: "菜场没货，按官方价算",
+    marketEmptyOfficial: "菜场没货，种子价格按官方价算",
     marketError: "菜场失败",
     insufficientMarket: "数量不够",
     quoteFailed: "报价失败",
@@ -1384,7 +1384,6 @@
 
   function buildPanelHtml() {
     const mainBlock = [
-      buildPlotUnlockHtml(),
       state.isLoading ? `<div class="farm-helper-state">正在抓接口并计算，请等一下。</div>` : "",
       state.error
         ? `<div class="farm-helper-error">数据加载失败：${escapeHtml(state.error)}</div>`
@@ -1424,7 +1423,7 @@
           <div class="farm-helper-card">
             ${mainBlock}
             <div class="farm-helper-footnote">
-              ${escapeHtml(LONG_TERM_FOOTNOTE)} 预计收菜时间 = 本次刷新时间 + 生长时间。菜场没货时按官方价算，菜场顺序不可信，脚本会自己排最低价。
+              ${escapeHtml(LONG_TERM_FOOTNOTE)} 预计收菜时间 = 本次刷新时间 + 生长时间。菜场没货时种子价格按官方价算，菜场顺序不可信，脚本会自己排最低价。
             </div>
           </div>
         </div>
@@ -1476,11 +1475,11 @@
           <div class="farm-helper-metrics">
             ${buildMetricHtml("续种每小时利润", formatCoin(row.replantHourlyProfit))}
             ${buildMetricHtml("回本轮数", formatRounds(row.replantBreakEvenRounds))}
-            ${buildMetricHtml("买1个实际总价", formatPurchase(row.buyOneResult))}
+            ${buildMetricHtml("含税种子实际价", formatPurchase(row.buyOneResult))}
             ${buildMetricHtml("续种单轮利润", formatCoin(row.replantProfit))}
             ${buildMetricHtml("预计收菜时间", formatDateTime(row.expectedHarvestAt))}
-            ${buildMetricHtml("交易所单价", formatCoin(row.recyclePrice))}
-            ${buildMetricHtml("菜场最低单价", formatCoin(row.marketMinUnitPrice))}
+            ${buildMetricHtml("交易所卖出单价", formatCoin(row.recyclePrice))}
+            ${buildMetricHtml("菜场种子最低单价", formatCoin(row.marketMinUnitPrice))}
             ${buildMetricHtml("官方种子单价", formatCoin(row.officialSeedPrice))}
           </div>
         </div>
@@ -1498,59 +1497,7 @@
   }
 
   function buildPlotUnlockHtml() {
-    const summary = state.plotSummary;
-    if (!summary) {
-      return "";
-    }
-
-    if (!summary.nextUnlock) {
-      return `
-        <div class="farm-helper-section">
-          <div class="farm-helper-section-head">
-            <h3>下一块地</h3>
-            <span class="farm-helper-tip">${escapeHtml(summary.statusText)}</span>
-          </div>
-        </div>
-      `;
-    }
-
-    const bestRow = summary.bestRow;
-    const plotIndexText = Number.isFinite(summary.nextUnlock.plotIndex) ? `第 ${summary.nextUnlock.plotIndex} 块` : "下一块";
-    const plotTypeText = summary.nextUnlockIsVip ? "VIP地块" : "普通地块";
-    const bestCropText = bestRow ? bestRow.name : "暂时算不出";
-    const bestTimeText = bestRow ? formatBreakEvenDuration(bestRow.plotBreakEvenSeconds) : "--";
-
-    return `
-      <div class="farm-helper-section">
-        <div class="farm-helper-section-head">
-          <h3>下一块地</h3>
-          <span class="farm-helper-tip">${escapeHtml(summary.statusText)}</span>
-        </div>
-        <div class="farm-helper-recommend plot-unlock">
-          <div class="farm-helper-hero">
-            <div>
-              <div class="farm-helper-name">
-                <strong>${escapeHtml(plotIndexText)}</strong>
-                <span class="farm-helper-pill ${summary.nextUnlockIsVip ? "vip" : ""}">${escapeHtml(plotTypeText)}</span>
-              </div>
-              <div class="farm-helper-tip">
-                开地成本 ${escapeHtml(formatCoin(summary.nextUnlock.cost))}，${escapeHtml(summary.statusText)}。
-              </div>
-            </div>
-            <div class="farm-helper-score">
-              <span>最快收完回本</span>
-              <strong>${escapeHtml(bestTimeText)}</strong>
-            </div>
-          </div>
-          <div class="farm-helper-metrics">
-            ${buildMetricHtml("开地成本", formatCoin(summary.nextUnlock.cost))}
-            ${buildMetricHtml("地块类型", plotTypeText)}
-            ${buildMetricHtml("所需等级", formatLevel(summary.nextUnlock.requiredLevel))}
-            ${buildMetricHtml("最快回本作物", bestCropText)}
-          </div>
-        </div>
-      </div>
-    `;
+    return "";
   }
 
   function buildTableHtml() {
@@ -1567,7 +1514,6 @@
 
     const rowsHtml = state.rows
       .map((row, index) => {
-        const statusTone = getStatusTone(row.statusKey);
         const buyOneTone = getPurchaseTone(row.buyOneResult, row.officialSeedPrice, 1);
         const officialDiffTone = getOfficialDiffTone(row.officialDiff);
         const replantHourlyTone = getProfitTone(row.replantHourlyProfit);
@@ -1584,17 +1530,16 @@
             </td>
             <td>${escapeHtml(formatDuration(row.growthSeconds))}</td>
             <td>${escapeHtml(String(row.harvestQuantity))}</td>
-            <td>${escapeHtml(formatCoin(row.recyclePrice))}</td>
-            <td>${escapeHtml(formatCoin(row.marketMinUnitPrice))}</td>
-            <td>${buildTableValue(formatPurchase(row.buyOneResult), buyOneTone)}</td>
             <td>${buildTableValue(formatCoin(row.replantHourlyProfit), replantHourlyTone)}</td>
             <td>${escapeHtml(formatCoin(row.replantProfit))}</td>
             <td>${escapeHtml(formatCoin(row.roundProfit))}</td>
             <td>${escapeHtml(formatCoin(row.hourlyProfit))}</td>
-            <td>${escapeHtml(formatDateTime(row.expectedHarvestAt))}</td>
+            <td>${escapeHtml(formatCoin(row.recyclePrice))}</td>
+            <td>${escapeHtml(formatCoin(row.marketMinUnitPrice))}</td>
             <td>${escapeHtml(formatCoin(row.officialSeedPrice))}</td>
             <td>${buildTableValue(formatCoin(row.officialDiff), officialDiffTone)}</td>
-            <td><span class="farm-helper-status ${statusTone}">${escapeHtml(row.statusText)}</span></td>
+            <td>${buildTableValue(formatPurchase(row.buyOneResult), buyOneTone)}</td>
+            <td>${escapeHtml(formatDateTime(row.expectedHarvestAt))}</td>
           </tr>
         `;
       })
@@ -1614,17 +1559,16 @@
                 <th>作物</th>
                 <th>生长</th>
                 <th>单块收获</th>
-                <th>交易所单价</th>
-                <th>菜场最低单价</th>
-                <th>买1个实际总价</th>
                 <th>续种每小时利润</th>
                 <th>续种单轮利润</th>
                 <th>首轮利润</th>
-                <th>首轮每小时</th>
-                <th>预计收菜时间</th>
+                <th>首轮每小时利润</th>
+                <th>交易所卖出单价</th>
+                <th>菜场种子最低单价</th>
                 <th>官方种子单价</th>
-                <th>官方价差</th>
-                <th>状态</th>
+                <th>种子价差</th>
+                <th>含税种子实际价</th>
+                <th>预计收菜时间</th>
               </tr>
             </thead>
             <tbody>${rowsHtml}</tbody>
